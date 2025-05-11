@@ -1,0 +1,1105 @@
+---
+title: "E1_UG_EEG"
+author: "JinGao"
+date: "05/05/2025"
+output: html_document
+---
+```{r setup, include=FALSE}
+# 全局设置：显示代码但隐藏警告和消息
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+## 1. 安装 Miniconda（只需运行一次）
+```{r install-miniconda, include=FALSE, eval=FALSE}
+# install.packages("reticulate")
+reticulate::install_miniconda()
+```
+
+
+## 2. 安装并链接 hu-neuro-pipeline
+```{r install-pipeline, eval=FALSE}
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+
+# 从本地路径以 editable 方式安装 pipeline
+reticulate::py_install(
+  packages = c("-e", "C:/EEG_R_Python_Pipeline_JG/hu-neuro-pipeline"),
+  pip     = TRUE,
+  envname = "r-reticulate"
+)
+```
+
+```{r update MNE and Matplotlib, eval=FALSE}
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+
+# pip 升级至最新 mne 和 matplotlib
+reticulate::py_install(
+  packages = c("mne", "matplotlib"),
+  pip     = TRUE,
+  envname = "r-reticulate"
+)
+```
+
+## 3. 加载 R 包
+```{r load-libraries}
+# Neuroconductor & CRAN
+source("https://neuroconductor.org/neurocLite.R")
+# neural_install('eegUtils')  # 如需安装 EEG 工具包
+install.packages("gtools")    # 仅需安装一次
+
+library(here)
+library(tidyverse)
+library(ggplot2)
+library(eegUtils)
+library(htmltools)
+library(vroom)
+library(gtools)
+library(magrittr)
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+
+```
+
+## 4. 配置 Python 环境 & 打补丁
+```{r configure-python-pipeline, include=FALSE}
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+
+py_run_string("
+import sys, os, pandas as pd, mne
+
+# 0) 清除旧版 pipeline 模块，保证后续重新加载
+for mod in list(sys.modules):
+    if mod.startswith('pipeline'):
+        sys.modules.pop(mod)
+
+# 0.5) patch QuadContourSet —— 给 contourpy 生成的 QuadContourSet 加上 .collections
+import matplotlib.contour as _mcont
+if not hasattr(_mcont.QuadContourSet, 'collections'):
+    _mcont.QuadContourSet.collections = property(lambda self: self.collections_)
+
+# 1) 导入 pipeline 各子模块
+import pipeline
+import pipeline.io as pio
+import pipeline.participant as ppart
+
+# 2) patch save_montage：确保正确导出 channel_locations.csv
+from mne.channels.layout import _find_topomap_coords
+def patched_save_montage(epochs, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    picks = mne.pick_types(epochs.info, eeg=True, exclude='bads')
+    chs   = [epochs.info['chs'][i] for i in picks]
+    coords = [ch['loc'][:3] for ch in chs]
+    df = pd.DataFrame(coords, columns=['cart_x','cart_y','cart_z'])
+    df.insert(0, 'channel', [ch['ch_name'] for ch in chs])
+    xy = _find_topomap_coords(epochs.info, picks, ignore_overlap=True) * 947
+    df[['x','y']] = xy
+    df.to_csv(os.path.join(output_dir, 'channel_locations.csv'), index=False)
+pio.save_montage = patched_save_montage
+
+# 3) patch save_epochs：只写 CSV，不再写 .fif
+def patched_save_epochs(epochs, output_dir, participant_id='', to_df=True):
+    os.makedirs(output_dir, exist_ok=True)
+    prefix = f\"{participant_id}_\" if participant_id else ''
+    if to_df:
+        df = epochs.to_data_frame(scalings={'eeg':1e6,'misc':1e6})
+        df.to_csv(os.path.join(output_dir, f\"{prefix}epo.csv\"), index=False)
+pio.save_epochs = patched_save_epochs
+ppart.save_epochs = patched_save_epochs
+")
+
+```
+
+```{r preprocess-logs, echo=TRUE}
+# 0) 日志预处理：.txt → filtered .csv（自动识别 UTF-8 / UTF-16LE）
+library(here)
+library(readr)
+library(dplyr)
+library(stringr)
+
+# 找到所有 .txt 日志，创建输出目录
+orig_logs <- list.files(
+  here("data", "csv_all"),
+  pattern    = "\\.txt$",
+  full.names = TRUE
+)
+out_dir <- here("data", "csv_filtered")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (fpath in orig_logs) {
+  # 1) 检测前两个字节：FF FE → UTF-16LE， 否则当 UTF-8
+  fb  <- file(fpath, "rb")
+  bom <- readBin(fb, "raw", n = 2)
+  close(fb)
+  encoding <- if (
+    length(bom) == 2 &&
+    identical(bom, as.raw(c(0xFF, 0xFE)))
+  ) "UTF-16LE" else "UTF-8"
+
+  # 2) 用 read_delim 读取，readr 会自动跳过 BOM
+  df <- read_delim(
+    fpath,
+    delim          = "\t",
+    col_types      = cols(),
+    show_col_types = FALSE,
+    locale         = locale(encoding = encoding)
+  )
+
+  # 3) 过滤 block != 7 并提取 emotion
+  df_clean <- df %>%
+    filter(block != 7) %>%
+    mutate(emotion = str_extract(stim, "enj|dis|dom|neu|aff"))
+
+  # 4) 写出 CSV
+  out_name <- paste0(
+    tools::file_path_sans_ext(basename(fpath)),
+    ".csv"
+  )
+  write_csv(df_clean, file.path(out_dir, out_name))
+}
+
+```
+
+```{r face-phase, eval=FALSE}
+# 1) Face-locked Phase
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+pipeline <- import("pipeline")
+
+res_face <- pipeline$group_pipeline(
+  raw_files     = here("data","raw_all_cropped"),
+  log_files     = here("data","csv_filtered"),
+  output_dir    = here("export","face_phase"),
+  epochs_dir    = here("epochs","face_phase"),
+  report_dir    = here("reports","face_phase_qc"), 
+  epochs_tmin   = -0.4,    # −400 ms
+  epochs_tmax   =  1.0,    #  1000 ms
+  triggers      = c(101:115, 201:215),
+  bad_channels  = "auto",
+  ica_method    = "fastica",
+  ica_n_components = 0.99,
+  highpass_freq = 0.05,
+  lowpass_freq  = 30.0,
+  components    = list(
+    name = list("P1","N170","EPN","LPP_face"),
+    tmin = list(0.080,0.130,0.200,0.400),
+    tmax = list(0.130,0.200,0.350,0.600),
+    roi  = list(
+      c("O1","O2","Oz","PO7","PO8"),
+      c("TP9","TP10","P7","P8","PO9","PO10","O1","O2"),
+      c("PO7","PO8","PO9","PO10","TP9","TP10"),
+      c("Pz","Cz","C1","C2","CP1","CP2")
+    )
+  ),
+  average_by = list(
+    Face_enj = "emotion=='enj' & reaction>0",
+    Face_dis = "emotion=='dis' & reaction>0",
+    Face_dom = "emotion=='dom' & reaction>0",
+    Face_neu = "emotion=='neu' & reaction>0",
+    Face_aff = "emotion=='aff' & reaction>0"
+  )
+)
+trials_face  <- res_face[[1]]
+evokeds_face <- res_face[[2]]
+config_face  <- res_face[[3]]
+```
+
+```{r offer-phase, eval=FALSE}
+# 2) Offer-locked Phase
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+pipeline <- import("pipeline")
+
+res_offer <- pipeline$group_pipeline(
+  raw_files     = here("data","raw_all_cropped"),
+  log_files     = here("data","csv_filtered"),
+  output_dir    = here("export","offer_phase"),
+  epochs_dir    = here("epochs","offer_phase"),
+  report_dir    = here("reports","offer_phase_qc"), 
+  epochs_tmin   = -0.4,    # −400 ms
+  epochs_tmax   =  1.0,    #  1000 ms
+  triggers      = c(10:89, 150:169),
+  bad_channels  = "auto",
+  ica_method    = "fastica",
+  ica_n_components = 0.99,
+  highpass_freq = 0.05,
+  lowpass_freq  = 30.0,
+  components    = list(
+    name = list("FRN","LPP_offer"),
+    tmin = list(0.200,0.400),
+    tmax = list(0.300,0.600),
+    roi  = list(
+      c("F3","Fz","F4","FC1","FC2","Cz"),
+      c("Pz","Cz","C1","C2","CP1","CP2")
+    )
+  ),
+  
+  average_by = list(
+    # 5:5
+    Face_enj_5_5 = "emotion=='enj' & Offers_Other==5 & Offers_You==5 & reaction>0",
+    Face_dis_5_5 = "emotion=='dis' & Offers_Other==5 & Offers_You==5 & reaction>0",
+    Face_dom_5_5 = "emotion=='dom' & Offers_Other==5 & Offers_You==5 & reaction>0",
+    Face_neu_5_5 = "emotion=='neu' & Offers_Other==5 & Offers_You==5 & reaction>0",
+    Face_aff_5_5 = "emotion=='aff' & Offers_Other==5 & Offers_You==5 & reaction>0",
+    # 6:4
+    Face_enj_6_4 = "emotion=='enj' & Offers_Other==6 & Offers_You==4 & reaction>0",
+    Face_dis_6_4 = "emotion=='dis' & Offers_Other==6 & Offers_You==4 & reaction>0",
+    Face_dom_6_4 = "emotion=='dom' & Offers_Other==6 & Offers_You==4 & reaction>0",
+    Face_neu_6_4 = "emotion=='neu' & Offers_Other==6 & Offers_You==4 & reaction>0",
+    Face_aff_6_4 = "emotion=='aff' & Offers_Other==6 & Offers_You==4 & reaction>0",
+    # 7:3
+    Face_enj_7_3 = "emotion=='enj' & Offers_Other==7 & Offers_You==3 & reaction>0",
+    Face_dis_7_3 = "emotion=='dis' & Offers_Other==7 & Offers_You==3 & reaction>0",
+    Face_dom_7_3 = "emotion=='dom' & Offers_Other==7 & Offers_You==3 & reaction>0",
+    Face_neu_7_3 = "emotion=='neu' & Offers_Other==7 & Offers_You==3 & reaction>0",
+    Face_aff_7_3 = "emotion=='aff' & Offers_Other==7 & Offers_You==3 & reaction>0",
+    # 8:2
+    Face_enj_8_2 = "emotion=='enj' & Offers_Other==8 & Offers_You==2 & reaction>0",
+    Face_dis_8_2 = "emotion=='dis' & Offers_Other==8 & Offers_You==2 & reaction>0",
+    Face_dom_8_2 = "emotion=='dom' & Offers_Other==8 & Offers_You==2 & reaction>0",
+    Face_neu_8_2 = "emotion=='neu' & Offers_Other==8 & Offers_You==2 & reaction>0",
+    Face_aff_8_2 = "emotion=='aff' & Offers_Other==8 & Offers_You==2 & reaction>0",
+    # 9:1
+    Face_enj_9_1 = "emotion=='enj' & Offers_Other==9 & Offers_You==1 & reaction>0",
+    Face_dis_9_1 = "emotion=='dis' & Offers_Other==9 & Offers_You==1 & reaction>0",
+    Face_dom_9_1 = "emotion=='dom' & Offers_Other==9 & Offers_You==1 & reaction>0",
+    Face_neu_9_1 = "emotion=='neu' & Offers_Other==9 & Offers_You==1 & reaction>0",
+    Face_aff_9_1 = "emotion=='aff' & Offers_Other==9 & Offers_You==1 & reaction>0"
+  )
+)
+
+trials_offer  <- res_offer[[1]]
+evokeds_offer <- res_offer[[2]]
+config_offer  <- res_offer[[3]]
+```
+
+# AFTER RUNNING PIPELINE ONCE
+## Now using pre-processed full 54 participant dataset
+Here, we load the data previously created for the full dataset of 54 participants
+```{r}
+trials <- read_csv(here("export","trials.csv")) 
+evokeds <- read_csv(here("export", "ave.csv")) 
+config <- jsonlite::read_json(here("export", "config.json"))
+output_dir <- here("export")
+```
+
+
+# trials_lat dataframe: Drop trials that aren't further analyzed
+* only clearly lateralized targets (without object positions 1,6,7,12)  
+* drop the "function only" condition from Exp1 that has no equivalent in Exp 2  
+
+
+```{r}
+trials_lat <- trials[!trials$lat == "none" & !trials$sem == "fun",]
+```
+
+# Plots
+
+# plot ERPs
+
+## erptheme
+set aesthetics for plots
+```{r ERP plot theme, include = FALSE}
+
+library(RColorBrewer)
+mypal <- brewer.pal(8, "Dark2") 
+# mypal <- mypal[c(1,3,2)]
+
+conds_cat <- c("Same", "Different")
+
+# New facet label names 
+lat.labs <- c("Left VF", "Right VF")
+names(lat.labs) <- c("li", "re")
+
+# New facet label names for supp variable
+exp.labs <- c("Experiment 1", "Experiment 2")
+names(exp.labs) <- c("1", "2")
+
+
+ erptheme <- (#theme_bw(base_size = 16)+
+  theme(panel.grid =element_blank()) +
+  theme(panel.border =element_blank()) +
+  theme(axis.line = element_line(color = "black", size =.8)) +
+  theme(axis.ticks = element_line(color = "black", size =.8)) +
+  # theme(legend.title = element_blank()) +
+  # theme(legend.text = element_text(size=16)) +
+  # theme(title = element_text(size=12)) +
+  # theme(axis.title = element_text(size=20)) + #
+ # theme(axis.title.x = element_blank()) +
+  # theme(legend.key = element_blank())+
+  theme(panel.background  = element_blank()) + 
+  theme(axis.text.y = element_text(color = "black"))+
+  theme(axis.text.x = element_text(color = "black")) +
+  theme(strip.background = element_rect(linetype =  "blank"))#+
+  # theme(strip.background = element_rect(fill = "orange", linetype =  "blank"))+
+  # theme(strip.text.x = element_text(size = 14)) +
+  # theme(strip.text.y = element_text(size = 14)))
+ )
+ 
+ erptheme <- list(erptheme, scale_fill_manual(values = mypal, labels = conds_cat), scale_color_manual(values = mypal, labels = conds_cat))
+  # theme(scale_fill_brewer(palette = "Dark2"))+
+  # theme(scale_color_brewer(palette = "Dark2"))
+             #  theme(axis.text.x = element_text(size = 16, color = "black")) +
+  # theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 16, color = "black")) )
+
+```
+
+
+## add columns to evokeds
+
+create columns for category (same, different), visual field (left, right), and experiment (1, 2)
+
+
+
+
+```{r}
+# evokeds <- evokeds[!is.nan(evokeds$P1py),]
+
+evokeds <- evokeds[!is.na(evokeds$Fp1),]
+
+evokeds <- evokeds %>% 
+  mutate(
+    cat =  case_when(label %in% c("same_li_exp1", "same_li_exp2", "same_re_exp1", "same_re_exp2") ~ 'same',
+                     label %in% c("diff_li_exp1", "diff_li_exp2",
+                                  "diff_re_exp1", "diff_re_exp2") ~ 'diff',
+    ),
+    lat = case_when(label %in% c("same_li_exp1", "same_li_exp2", "diff_li_exp1", "diff_li_exp2") ~ 'li',
+                    label %in% c("same_re_exp1", "same_re_exp2", "diff_re_exp1", "diff_re_exp2") ~ 're',
+                    ),
+    exp = case_when(label %in% c("same_li_exp1", "same_re_exp1", "diff_li_exp1", "diff_re_exp1") ~ '1',
+    label %in% c("same_li_exp2", "same_re_exp2", "diff_li_exp2", "diff_re_exp2") ~ '2',
+    )
+  )
+         
+evokeds$lat <- as.factor(evokeds$lat)
+evokeds$cat <- as.factor(evokeds$cat)
+evokeds$cat <- relevel(evokeds$cat, "same") # relevel category to have same first
+evokeds$exp <- as.factor(evokeds$exp)
+evokeds$label <- as.factor(evokeds$label)
+
+
+# str(evokeds)
+
+
+```
+
+## PO3 ERP plot for Figure 2:
+ERPs in the same and different category condition at posterior electrode PO3, with time windows for  P1, N1, and N2 highlighted.  
+
+During averaging, trials with NA in the EEG data are dropped (were set to NA during artifact correction, which might mess with averaging).
+
+```{r ERP PO3}
+library(dplyr)
+# evokeds$lat <- as.character(evokeds$lat)
+# Evokeds by participant/condition
+evokeds[!is.nan(evokeds$P1py),] %>%
+  # filter(average_by == "exp/ErrorCode/sem/lat/cat/RTout", !lat == "none", !sem == "fun",  ErrorCode=="255", RTout == 0) %>%
+  # filter(label %in% c("diff_re_exp1", "same_re_exp1", "diff_re_exp2", "same_re_exp2")) %>%
+  # filter(lat != "NA") %>%
+ # subevok %>%
+  # filter(average_by == "lat/cat") %>%
+  Rmisc::summarySEwithin(
+    measurevar = c("PO3"),
+    withinvars = c("time", "lat", "cat"),
+    betweenvars = c("exp"),
+    idvar = "participant_id",
+    na.rm = TRUE) %>%
+  mutate(time = as.numeric(levels(time))[time]) %>%
+  ggplot(aes(
+    x = time,
+    y = PO3,
+    # ymin = P1py - se,
+    # ymax = P1py + se,
+    color = cat,
+    fill = cat
+  )) +
+  # shade?
+  geom_rect(aes(xmin = 80, xmax = 120, ymin = -Inf, ymax = Inf),
+             fill = "#E6F0FC", colour = "#E6F0FC") + 
+  geom_rect(aes(xmin = 140, xmax = 180, ymin = -Inf, ymax = Inf),
+             fill = "#CADEFA", colour = "#CADEFA") + 
+  geom_rect(aes(xmin = 240, xmax = 300, ymin = -Inf, ymax = Inf),
+             fill = "#A9C9F5", colour = "#A9C9F5") + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_line(size = .5) +
+  # geom_ribbon(color = NA, alpha = 0.2) +
+  coord_cartesian(xlim = c(-100, 700), ylim = c(-6, 6)) +
+  theme_classic(base_size = 20) -> plot_erp_PO3
+
+plot_erp_PO3 <- plot_erp_PO3 + facet_grid(vars(exp), vars(lat), labeller = labeller(exp = exp.labs, lat = lat.labs)) + erptheme +  xlab("Time (ms)") + ylab("Amplitude (µV)") + labs(colour="Category") + theme(legend.position = "top",legend.margin=margin(-15,-15,-15,-15),legend.box.margin=margin(5,5,5,5)) #,legend.box.margin=margin(-10,-10,-10,-10)
+
+plot_erp_PO3
+
+
+# ggsave(plot_erp_PO3, filename = here::here("plots", "plot_erp_PO3.pdf"), width = 22, height = 16, units = "cm")
+
+
+```
+
+## ERP P1 ROI plot
+
+```{r ERP P1roi}
+# library(dplyr)
+# evokeds$lat <- as.character(evokeds$lat)
+# Evokeds by participant/condition
+evokeds[!is.nan(evokeds$P1py),] %>%
+  Rmisc::summarySEwithin(
+    measurevar = c("P1py"),
+    withinvars = c("time", "lat", "cat"),
+    betweenvars = c("exp"),
+    idvar = "participant_id",
+    na.rm = TRUE) %>%
+  mutate(time = as.numeric(levels(time))[time]) %>%
+  ggplot(aes(
+    x = time,
+    y = P1py,
+    # ymin = P1py - se,
+    # ymax = P1py + se,
+    color = cat,
+    fill = cat
+  )) +
+  # shade?
+  geom_rect(aes(xmin = 80, xmax = 120, ymin = -Inf, ymax = Inf),
+            alpha = 1/5, fill = "grey85", colour = "grey85") + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_line(size = 1) +
+  # geom_ribbon(color = NA, alpha = 0.2) +
+  coord_cartesian(xlim = c(-100, 700), ylim = c(-6, 6)) +
+  theme_classic(base_size = 20) -> plot_erp_P1roi
+
+plot_erp_P1roi <- plot_erp_P1roi + facet_grid(vars(exp), vars(lat)) + erptheme
+
+plot_erp_P1roi
+
+
+## zoom in
+plot_erp_P1roi_zoom <- plot_erp_P1roi + coord_cartesian(xlim = c(50, 130), ylim = c(2.5, 3.8))
+plot_erp_P1roi_zoom
+
+
+# ggsave(plot_erp_P1roi, filename = here("plots", "plot_erp_P1roi.pdf"), width = 20, height = 16, units = "cm")
+# ggsave(plot_erp_P1roi_zoom, filename = here("plots", "plot_erp_P1roi_zoom.pdf"), width = 18, height = 16, units = "cm")
+
+
+```
+
+
+## ERP N1 ROI plot
+
+```{r ERP N1roi}
+# library(dplyr)
+# evokeds$lat <- as.character(evokeds$lat)
+# Evokeds by participant/condition
+evokeds[!is.nan(evokeds$N1py),] %>%
+    Rmisc::summarySEwithin(
+    measurevar = c("N1py"),
+    withinvars = c("time", "lat", "cat"),
+    betweenvars = c("exp"),
+    idvar = "participant_id",
+    na.rm = TRUE) %>%
+  mutate(time = as.numeric(levels(time))[time]) %>%
+  ggplot(aes(
+    x = time,
+    y = N1py,
+    # ymin = P1py - se,
+    # ymax = P1py + se,
+    color = cat,
+    fill = cat
+  )) +
+  # shade?
+  geom_rect(aes(xmin = 140, xmax = 180, ymin = -Inf, ymax = Inf),
+            alpha = 1/5, fill = "grey85", colour = "grey85") + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_line(size = 1) +
+  # geom_ribbon(color = NA, alpha = 0.2) +
+  coord_cartesian(xlim = c(-100, 700), ylim = c(-6, 6)) +
+  theme_classic(base_size = 20) -> plot_erp_N1roi
+
+plot_erp_N1roi <- plot_erp_N1roi + facet_grid(vars(exp), vars(lat)) + erptheme
+
+plot_erp_N1roi
+
+
+## zoom in
+plot_erp_N1roi_zoom <- plot_erp_N1roi + coord_cartesian(xlim = c(130, 190), ylim = c(-6, -2.5))
+plot_erp_N1roi_zoom
+
+
+# ggsave(plot_erp_N1roi, filename = here("plots", "plot_erp_N1roi.pdf"), width = 20, height = 16, units = "cm")
+# ggsave(plot_erp_N1roi_zoom, filename = here("plots", "plot_erp_N1roi.pdf"), width = 18, height = 16, units = "cm")
+
+
+```
+
+
+## ERP N2 ROI plot
+
+```{r ERP N2roi}
+# library(dplyr)
+# evokeds$lat <- as.character(evokeds$lat)
+# Evokeds by participant/condition
+evokeds[!is.nan(evokeds$N2py),] %>%
+    Rmisc::summarySEwithin(
+    measurevar = c("N2py"),
+    withinvars = c("time", "lat", "cat"),
+    betweenvars = c("exp"),
+    idvar = "participant_id",
+    na.rm = TRUE) %>%
+  mutate(time = as.numeric(levels(time))[time]) %>%
+  ggplot(aes(
+    x = time,
+    y = N2py,
+    # ymin = P1py - se,
+    # ymax = P1py + se,
+    color = cat,
+    fill = cat
+  )) +
+  # shade?
+  geom_rect(aes(xmin = 240, xmax = 300, ymin = -Inf, ymax = Inf),
+            alpha = 1/5, fill = "grey85", colour = "grey85") + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_line(size = 1) +
+  # geom_ribbon(color = NA, alpha = 0.2) +
+  coord_cartesian(xlim = c(-100, 700), ylim = c(-6, 6.5)) +
+  theme_classic(base_size = 20) -> plot_erp_N2roi
+
+plot_erp_N2roi <- plot_erp_N2roi + facet_grid(vars(exp), vars(lat)) + erptheme
+
+plot_erp_N2roi
+
+
+
+# ggsave(plot_erp_N2roi, filename = here("plots", "plot_erp_N2roi.pdf"), width = 20, height = 16, units = "cm")
+
+
+```
+
+## Topoplots for Figure 2
+
+To plot different time windows and highlight different ROI electrodes, see key below:  
+
+ P1: 80-120 ms \@ c("PO3", "PO4", "O1", "O2", "PO7", "PO8")\  
+ N1: 140-180 ms \@ c("PO3", "PO4", "POz", "Oz", "PO7", "PO8")\  
+ N2: 240-300 ms \@ c("O1", "O2", "PO7", "PO8", "PO3", "PO4")   
+
+### CP RVF EXP1
+This code can be used to plot topographies for category differences (different-same category) in the right visual field; to plot a specific time window or ROI, adapt tmin and tmax, and ROI below
+
+```{r, topoplot same-diff VF EXP, echo = FALSE}
+# Load by-participant averages (evokeds)
+# evokeds <- read_csv(here(output_dir, "ave.csv"))
+# Load channel locations
+channel_locations <- read_csv(here::here(output_dir, "channel_locations.csv"))
+channels <- channel_locations$channel
+
+# channel_locations$electrode <- channel_locations$channel
+
+P1roi <- c("PO3", "PO4", "O1", "O2", "PO7", "PO8")
+N1roi <- c("PO3", "PO4", "POz", "Oz", "PO7", "PO8")
+N2roi <- c("O1", "O2", "PO7", "PO8", "PO3", "PO4")
+
+
+
+evokeds_same_re_exp1 <- evokeds[evokeds$exp == 1 & !is.nan(evokeds$Fp1) & evokeds$label == "same_re_exp1",]
+evokeds_same_re_exp11 <- evokeds_same_re_exp1[evokeds_same_re_exp1$exp == 1,]
+evokeds_diff_re_exp1 <- evokeds[evokeds$ exp == 1 & !is.nan(evokeds$P1py) & evokeds$label == "diff_re_exp1",] 
+
+
+# Compute difference waves between conditions
+evokeds_cp_re_exp1 <- evokeds_diff_re_exp1 # Just a copy for now; magic is in the next line
+evokeds_cp_re_exp1[channels] <- evokeds_diff_re_exp1[channels] - evokeds_same_re_exp1[channels]
+
+# Install eegUtils from GitHub for the `topoplot()` function
+# remotes::install_github("craddm/eegUtils")
+# Option 1: Create a topoplot for a single time window (here: N2 time window)
+tmin <- 140   #80   # 240  #      
+tmax <- 180   #120  # 300  #      
+
+#plot
+evokeds_cp_re_exp1 %>%
+  # Select time window
+  filter(time >= tmin & time < tmax) %>%
+  # Convert channels (electrodes) to long format
+  # In pipeline lingo, we call them channels (see the COBIDAS guidelines), but
+  # here we call the column `electrode` because that's what `topoplot()` expects
+  pivot_longer(channels, names_to = "electrode", values_to = "amplitude")  %>%
+  # Average over participants and time samples
+  dplyr::group_by(electrode) %>%
+  dplyr::summarise(amplitude = mean(amplitude)) %>%
+  # Add channel locations
+  left_join(channel_locations, by = c("electrode" = "channel"))  %>%
+  # Fire! This creates a ggplot, so you can add titles, labels, colors as usual
+  # See ?eegUtils::topoplot for more options
+  # eegUtils::topoplot(limits = c(-.31, .31), scaling = .5, palette = "viridis", highlights = N1roi) ->  topo_cp_re_exp1
+  eegUtils::topoplot(limits = c(-.31, .31), r = 1.2, interp_limit = "head", scaling = .5, palette = "viridis", highlights = N1roi) ->  topo_cp_re_exp1  #  interp_limit = "head", r = 1.105
+
+
+topo_cp_re_exp1 <- topo_cp_re_exp1 +  theme(legend.position = "bottom", legend.title.align = 0.5, legend.text=element_text(size=12))  +  guides( fill= guide_colorbar(title = "Amplitude (µV)", title.position = "top", title.theme = element_text(size = 12)))
+
+topo_cp_re_exp1 <- topo_cp_re_exp1 + scale_fill_viridis_c(limits = c(-.31,.31), oob = scales::squish ,breaks = c(-.3, 0, .3))
+
+topo_cp_re_exp1
+ # ggsave(topo_cp_re_exp1, filename = here::here("plots", "topo_P1_cp_re_exp1.pdf"), width = 8, height = 8, units = "cm")
+ # ggsave(topo_cp_re_exp1, filename = here::here("plots", "topo_N1_cp_re_exp1.pdf"), width = 8, height = 8, units = "cm")
+# ggsave(topo_cp_re_exp1, filename = here::here("plots", "topo_N2_cp_re_exp1.pdf"), width = 8, height = 8, units = "cm")
+
+  
+```
+
+
+### CP LVF EXP1
+```{r, topoplot P1 CP LVF EXP1, echo = FALSE}
+# Load by-participant averages (evokeds)
+# evokeds <- read_csv(here(output_dir, "ave.csv"))
+# Load channel locations
+# channel_locations <- read_csv(here(output_dir, "channel_locations.csv"))
+# channels <- channel_locations$channel
+
+
+evokeds_same_li_exp1 <- evokeds[evokeds$exp == 1 & !is.nan(evokeds$P1py) & evokeds$label == "same_li_exp1",]
+evokeds_diff_li_exp1 <- evokeds[evokeds$exp == 1 & !is.nan(evokeds$P1py) & evokeds$label == "diff_li_exp1",]
+
+P1roi <- c("PO3", "PO4", "O1", "O2", "PO7", "PO8")
+N1roi <- c("PO3", "PO4", "POz", "Oz", "PO7", "PO8")
+N2roi <- c("O1", "O2", "PO7", "PO8", "PO3", "PO4")
+
+
+# Compute difference waves between conditions
+evokeds_cp_li_exp1 <- evokeds_diff_li_exp1 # Just a copy for now; magic is in the next line
+evokeds_cp_li_exp1[channels] <- evokeds_diff_li_exp1[channels] - evokeds_same_li_exp1[channels]
+
+# Install eegUtils from GitHub for the `topoplot()` function
+# remotes::install_github("craddm/eegUtils")
+# Option 1: Create a topoplot for a single time window (here: N2 time window)
+tmin <- 240 # 80  #  140  # 
+tmax <- 300 #120  #  180  # 
+evokeds_cp_li_exp1 %>%
+  # Select time window
+  filter(time >= tmin & time < tmax) %>%
+  # Convert channels (electrodes) to long format
+  # In pipeline lingo, we call them channels (see the COBIDAS guidelines), but
+  # here we call the column `electrode` because that's what `topoplot()` expects
+  pivot_longer(channels, names_to = "electrode", values_to = "amplitude") %>%
+  # Average over participants and time samples
+  dplyr::group_by(electrode) %>%
+  dplyr::summarise(amplitude = mean(amplitude)) %>%
+  # Add channel locations
+  left_join(channel_locations, by = c("electrode" = "channel")) %>%
+  # Fire! This creates a ggplot, so you can add titles, labels, colors as usual
+  # See ?eegUtils::topoplot for more options
+  eegUtils::topoplot(limits = c(-.31, .31), r = 1.2, interp_limit = "head", scaling = .5, palette = "viridis", highlights = N2roi) ->  topo_cp_li_exp1
+
+
+
+topo_cp_li_exp1 <- topo_cp_li_exp1 +  theme(legend.position = "bottom", legend.title.align = 0.5, legend.text=element_text(size=12))  +  guides( fill= guide_colorbar(title = "Amplitude (µV)", title.position = "top", title.theme = element_text(size = 12)))
+# 
+topo_cp_li_exp1 <- topo_cp_li_exp1 + scale_fill_viridis_c(limits = c(-.31,.31), oob = scales::squish ,breaks = c(-.3, 0, .3))
+
+topo_cp_li_exp1
+
+ 
+ # ggsave(topo_cp_li_exp1, filename = here::here("plots", "topo_P1_cp_li_exp1.pdf"), width = 8, height = 8, units = "cm")
+ # ggsave(topo_cp_li_exp1, filename = here::here("plots", "topo_N1_cp_li_exp1.pdf"), width = 8, height = 8, units = "cm")
+# ggsave(topo_cp_li_exp1, filename = here::here("plots", "topo_N2_cp_li_exp1.pdf"), width = 8, height = 8, units = "cm")
+
+  
+```
+
+
+### CP RVF EXP2
+```{r, topoplot P1 CP RVF EXP2, echo = FALSE}
+# Load by-participant averages (evokeds)
+# evokeds <- read_csv(here(output_dir, "ave.csv"))
+# Load channel locations
+# channel_locations <- read_csv(here(output_dir, "channel_locations.csv"))
+# channels <- channel_locations$channel
+
+
+evokeds_same_re_exp2 <- filter(evokeds[!is.nan(evokeds$P1py),], label == "same_re_exp2")
+evokeds_diff_re_exp2 <- filter(evokeds[!is.nan(evokeds$P1py),], label == "diff_re_exp2")
+
+P1roi <- c("PO3", "PO4", "O1", "O2", "PO7", "PO8")
+N1roi <- c("PO3", "PO4", "POz", "Oz", "PO7", "PO8")
+N2roi <- c("O1", "O2", "PO7", "PO8", "PO3", "PO4")
+
+
+# Compute difference waves between conditions
+evokeds_cp_re_exp2 <- evokeds_diff_re_exp2 # Just a copy for now; magic is in the next line
+evokeds_cp_re_exp2[channels] <- evokeds_diff_re_exp2[channels] - evokeds_same_re_exp2[channels]
+
+# Install eegUtils from GitHub for the `topoplot()` function
+# remotes::install_github("craddm/eegUtils")
+# Option 1: Create a topoplot for a single time window (here: N2 time window)
+tmin <-  240  #  80 # 140   # 
+tmax <-  300  # 120 # 180   # 
+evokeds_cp_re_exp2 %>%
+  # Select time window
+  filter(time >= tmin & time < tmax) %>%
+  # Convert channels (electrodes) to long format
+  # In pipeline lingo, we call them channels (see the COBIDAS guidelines), but
+  # here we call the column `electrode` because that's what `topoplot()` expects
+  pivot_longer(channels, names_to = "electrode", values_to = "amplitude") %>%
+  # Average over participants and time samples
+  dplyr::group_by(electrode) %>%
+  dplyr::summarise(amplitude = mean(amplitude)) %>%
+  # Add channel locations
+  left_join(channel_locations, by = c("electrode" = "channel")) %>%
+  # Fire! This creates a ggplot, so you can add titles, labels, colors as usual
+  # See ?eegUtils::topoplot for more options
+  eegUtils::topoplot(limits = c(-.31, .31), r = 1.2, interp_limit = "head", scaling = .5, palette = "viridis", highlights = N2roi) ->  topo_cp_re_exp2
+
+topo_cp_re_exp2 <- topo_cp_re_exp2 +  theme(legend.position = "bottom", legend.title.align = 0.5, legend.text=element_text(size=12))  +  guides( fill= guide_colorbar(title = "Amplitude (µV)", title.position = "top", title.theme = element_text(size = 12)))
+# 
+topo_cp_re_exp2 <- topo_cp_re_exp2 + scale_fill_viridis_c(limits = c(-.31,.31), oob = scales::squish ,breaks = c(-.3, 0, .3))
+ topo_cp_re_exp2
+ 
+ # ggsave(topo_cp_re_exp2, filename = here::here("plots", "topo_P1_cp_re_exp2.pdf"), width = 8, height = 8, units = "cm")
+ # ggsave(topo_cp_re_exp2, filename = here::here("plots", "topo_N1_cp_re_exp2.pdf"), width = 8, height = 8, units = "cm")
+ # ggsave(topo_cp_re_exp2, filename = here::here("plots", "topo_N2_cp_re_exp2.pdf"), width = 8, height = 8, units = "cm")
+
+ # ggsave(topo_cp_re_exp2, filename = here::here("plots", "topo_big_legend.pdf"), width = 8, height = 8, units = "cm")
+   
+```
+
+
+### CP LVF EXP2
+```{r, topoplot P1 CP LVF EXP2, echo = FALSE}
+# Load by-participant averages (evokeds)
+# evokeds <- read_csv(here(output_dir, "ave.csv"))
+# Load channel locations
+# channel_locations <- read_csv(here(output_dir, "channel_locations.csv"))
+# channels <- channel_locations$channel
+
+
+evokeds_same_li_exp2 <- filter(evokeds[!is.nan(evokeds$P1py),], label == "same_li_exp2")
+evokeds_diff_li_exp2 <- filter(evokeds[!is.nan(evokeds$P1py),], label == "diff_li_exp2")
+
+
+# P1roi <- c("PO3", "PO4", "O1", "O2", "PO7", "PO8")
+# N1roi <- c("PO3", "PO4", "POz", "Oz", "PO7", "PO8")
+# N2roi <- c("O1", "O2", "PO7", "PO8", "PO3", "PO4")
+
+
+# Compute difference waves between conditions
+evokeds_cp_li_exp2 <- evokeds_diff_li_exp2 # Just a copy for now; magic is in the next line
+evokeds_cp_li_exp2[channels] <- evokeds_diff_li_exp2[channels] - evokeds_same_li_exp2[channels]
+
+# Install eegUtils from GitHub for the `topoplot()` function
+# remotes::install_github("craddm/eegUtils")
+# Option 1: Create a topoplot for a single time window (here: N2 time window)
+tmin <- 240  #  80  # 140   # 
+tmax <- 300  # 120  # 180   # 
+evokeds_cp_li_exp2 %>%
+  # Select time window
+  filter(time >= tmin & time < tmax) %>%
+  # Convert channels (electrodes) to long format
+  # In pipeline lingo, we call them channels (see the COBIDAS guidelines), but
+  # here we call the column `electrode` because that's what `topoplot()` expects
+  pivot_longer(channels, names_to = "electrode", values_to = "amplitude") %>%
+  # Average over participants and time samples
+  dplyr::group_by(electrode) %>%
+  dplyr::summarise(amplitude = mean(amplitude)) %>%
+  # Add channel locations
+  left_join(channel_locations, by = c("electrode" = "channel")) %>%
+  # Fire! This creates a ggplot, so you can add titles, labels, colors as usual
+  # See ?eegUtils::topoplot for more options
+  eegUtils::topoplot(limits = c(-.31, .31), r = 1.2, interp_limit = "head", scaling = .5, palette = "viridis", highlights = N2roi) ->  topo_cp_li_exp2
+
+topo_cp_li_exp2 <- topo_cp_li_exp2 +  theme(legend.position = "bottom", legend.title.align = 0.5, legend.text=element_text(size=12))  +  guides( fill= guide_colorbar(title = "Amplitude (µV)", title.position = "top", title.theme = element_text(size = 12))) 
+
+topo_cp_li_exp2 <- topo_cp_li_exp2 + scale_fill_viridis_c(limits = c(-.31,.31), oob = scales::squish ,breaks = c(-.3, 0, .3))
+
+topo_cp_li_exp2
+ # ggsave(topo_cp_li_exp2, filename = here::here("plots", "topo_P1_cp_li_exp2.pdf"), width = 8, height = 8, units = "cm")
+ # ggsave(topo_cp_li_exp2, filename = here::here("plots", "topo_N1_cp_li_exp2.pdf"), width = 8, height = 8, units = "cm")
+# ggsave(topo_cp_li_exp2, filename = here::here("plots", "topo_N2_cp_li_exp2.pdf"), width = 8, height = 8, units = "cm")
+
+```
+
+
+
+
+# Analyses
+
+```{r, echo=FALSE}
+library(lme4)
+library(afex)
+library(sjPlot)
+```
+## contrasts
+
+```{r contrasts, echo=FALSE}
+library(MASS)
+# library(dplyr)
+
+trials_lat$lat <- as.character(trials_lat$lat)
+trials_lat$exp <- as.character(trials_lat$exp)
+trials_lat$cat <- as.character(trials_lat$cat)
+
+
+trials_lat$lat <- factor(trials_lat$lat, levels = c("li", "re"), labels = c("Left VF", "Right VF"))
+contrasts(trials_lat$lat) <- contr.sdif(2)
+
+trials_lat$sem <- as.character(trials_lat$sem)
+trials_lat$sem <- as.factor(trials_lat$sem)
+contrasts(trials_lat$sem) <- contr.sdif(2)
+
+trials_lat$exp <- factor(trials_lat$exp, levels = c("1", "2"), labels = c("Experiment 1", "Experiment 2"))
+contrasts(trials_lat$exp) <- contr.sdif(2)
+
+
+trials_lat$cat <- factor(trials_lat$cat, levels = c("same", "diff"), labels = c("Same", "Different"))
+contrasts(trials_lat$cat) <- contr.sdif(2)
+
+
+```
+
+## LMMs
+
+### Buildmer P1py
+
+```{r buildmer P1py, eval = FALSE, include = FALSE}
+# remotes::install_version("buildmer", "1.9")
+# library(buildmer)
+# Make our modelling formula explicit and assign fixed effects to the same "block"
+form <- tabulate.formula(~ lat * exp * cat + (lat * cat | VPNummer) + (lat * cat | Deviant),)
+form <- mutate(form, block = replace(block, is.na(grouping), "fixed"))
+# Build one final LMM considering all the above
+build_P1py <- buildmer(dep = "P1py",
+                        formula = form,
+                        data = trials_lat[trials_lat$ErrorCode == "255" & trials_lat$RTout == "0" & !is.na(trials_lat$P1py),],
+                        REML = FALSE, # or TRUE
+                        control = lmerControl(calc.derivs = FALSE,
+                                              optimizer = "bobyqa",
+                                              optCtrl = list(maxfun = 2e5)),
+                        buildmerControl = buildmerControl(ddf = "Satterthwaite", # or "Kenward-Roger"
+                                                          direction = c("backward", "backward"),
+                                                          elim = function(logp) exp(logp) >= .20))
+                       
+(f <- formula(build_P1py@model))
+# P1py ~ 1 + lat + exp + lat:exp + cat + lat:cat + exp:cat + lat:exp:cat + (1 | VPNummer)
+
+```
+
+
+### P1 nested 1
+As reported in text
+
+```{r lmm P1py_nest1}
+#P1py ~ 1 + cond + (1 | subject) + (1 | bot_id)
+
+print (summary(
+  m_P1py_nest1 <- lmer_alt(P1py ~ lat/(exp*cat) +
+                       (1 | VPNummer),
+                     data = trials_lat[trials_lat$ErrorCode == "255" & trials_lat$RTout == "0" & !is.na(trials_lat$P1py),],
+                          control = lmerControl(calc.derivs = FALSE,
+                          optimizer = "bobyqa", 
+                          optCtrl = list(maxfun = 2e5)))))
+
+```
+
+### P1 nested 1b
+As reported in Table 2
+```{r lmm P1py_nest1b}
+#P1py ~ 1 + cond + (1 | subject) + (1 | bot_id)
+
+print (summary(
+  m_P1py_nest1b <- lmer_alt(P1py ~ lat/exp/cat +
+                       (1 | VPNummer),
+                     data = trials_lat[trials_lat$ErrorCode == "255" & trials_lat$RTout == "0" & !is.na(trials_lat$P1py),],
+                          control = lmerControl(calc.derivs = FALSE,
+                          optimizer = "bobyqa", 
+                          optCtrl = list(maxfun = 2e5)))))
+
+```
+
+### P1 plot model for Figure 2B
+```{r plot model m_P1py_nest1b, echo=FALSE}
+# devtools::install_github("strengejacke/sjPlot") 
+library(sjPlot)
+plot_m_p1 <- plot_model(m_P1py_nest1b, type = "emm", terms = c("lat", "cat", "exp"), mdrt.values = "meansd", dodge = .5) 
+
+plot_m_p1 <- plot_m_p1 + labs(y = "P1 Amplitude", x = "Visual Field", colour = "Category", title = NULL) + font_size(axis_title.x = 16, axis_title.y = 16, labels.x = 14, labels.y = 14) + theme(strip.text = element_text(size = 12), legend.text = element_text(size = 14), legend.title =  element_text(size = 14)) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + erptheme 
+
+# plot_m_p1 <- plot_m_p1 + geom_point(position = position_dodge(.8))
+
+plot_m_p1
+# font_size(title, axis_title.x, axis_title.y, labels.x, labels.y, offset.x,
+  # offset.y, base.theme)
+
+
+# ggsave(filename = here::here("plots", "plot_m_p1.pdf"), plot = plot_m_p1,
+#        width = 11, height = 10, units = "cm", dpi = 300)
+
+```
+
+
+### N1 nested 1
+as reported in text
+```{r lmm N1_nest1}
+
+print (summary(
+  m_N1_nest1 <- lmer_alt(N1py ~ lat/(exp*cat) +
+                       (1 | VPNummer),
+                     data = trials_lat[trials_lat$ErrorCode == "255" & trials_lat$RTout == "0" & !is.na(trials_lat$N1py),],
+                          control = lmerControl(calc.derivs = FALSE,
+                          optimizer = "bobyqa", 
+                          optCtrl = list(maxfun = 2e5)))))
+
+```
+
+### N1 nested 1b
+as reported in Table 2
+```{r lmm N1_nest1b}
+
+print (summary(
+  m_N1_nest1b <- lmer_alt(N1py ~ lat/exp/cat +
+                       (1 | VPNummer),
+                     data = trials_lat[trials_lat$ErrorCode == "255" & trials_lat$RTout == "0" & !is.na(trials_lat$N1py),],
+                          control = lmerControl(calc.derivs = FALSE,
+                          optimizer = "bobyqa", 
+                          optCtrl = list(maxfun = 2e5)))))
+
+```
+
+
+
+### N1 plot model for Figure 2B
+```{r plot model m_N1py_nest1b}
+# devtools::install_github("strengejacke/sjPlot") 
+# library(sjPlot)
+plot_m_n1 <- plot_model(m_N1_nest1b, type = "emm", terms = c("lat", "cat", "exp"), mdrt.values = "meansd", dodge = .5) 
+
+plot_m_n1 <- plot_m_n1 + labs(y = "N1/N170 Amplitude", x = "Visual Field", colour = "Category", title = NULL) + font_size(axis_title.x = 16, axis_title.y = 16, labels.x = 14, labels.y = 14) + theme(strip.text = element_text(size = 12), legend.text = element_text(size = 14), legend.title =  element_text(size = 14)) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + erptheme 
+
+# plot_m_n1 <- plot_m_n1 + geom_point(position = position_dodge(.8))
+
+
+# font_size(title, axis_title.x, axis_title.y, labels.x, labels.y, offset.x,
+  # offset.y, base.theme)
+plot_m_n1
+
+# ggsave(filename = here::here("plots", "plot_m_n1.pdf"), plot = plot_m_n1,
+#        width = 11, height = 10, units = "cm", dpi = 300)
+
+```
+
+
+
+### N2 nested 1
+As reported in text  
+experiments differ in CP in the RVF
+```{r lmm N2_nest}
+
+print (summary(
+  m_N2_nest <- lmer_alt(N2py ~ lat/(exp*cat) +
+                       (1 | VPNummer),
+                     data = trials_lat[trials_lat$ErrorCode == "255" & trials_lat$RTout == "0" & !is.na(trials_lat$N2py),],
+                          control = lmerControl(calc.derivs = FALSE,
+                          optimizer = "bobyqa", 
+                          optCtrl = list(maxfun = 2e5)))))
+
+```
+
+### N2 nested 1b
+As reported in Table 2  
+
+Exp 1 has a significant CP effect in the RVF only;
+```{r lmm N2_nest1b}
+
+print (summary(
+  m_N2_nest1b <- lmer_alt(N2py ~ lat/exp/cat +
+                       (1 | VPNummer),
+                     data = trials_lat[trials_lat$ErrorCode == "255" & trials_lat$RTout == "0" & !is.na(trials_lat$N2py),],
+                          control = lmerControl(calc.derivs = FALSE,
+                          optimizer = "bobyqa", 
+                          optCtrl = list(maxfun = 2e5)))))
+
+```
+
+
+### N2 plot model for Figure 2B
+```{r plot model m_N2py_nest1b}
+# devtools::install_github("strengejacke/sjPlot") 
+# library(sjPlot)
+plot_m_n2 <- plot_model(m_N2_nest1b, type = "emm", terms = c("lat", "cat", "exp"), mdrt.values = "meansd", dodge = .5) 
+
+plot_m_n2 <- plot_m_n2 + labs(y = "N2 Amplitude", x = "Visual Field", colour = "Category", title = NULL) + font_size(axis_title.x = 16, axis_title.y = 16, labels.x = 14, labels.y = 14) + theme(strip.text = element_text(size = 12), legend.text = element_text(size = 14), legend.title =  element_text(size = 16)) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + erptheme 
+
+# plot_m_n2 <- plot_m_n2 + geom_point(position = position_dodge(.8))
+
+
+# font_size(title, axis_title.x, axis_title.y, labels.x, labels.y, offset.x,
+  # offset.y, base.theme)
+
+plot_m_n2
+# ggsave(filename = here::here("plots", "plot_m_n2.pdf"), plot = plot_m_n2,
+#        width = 11, height = 10, units = "cm", dpi = 300)
+
+```
+
+# tab_model all components; nest 1b
+This function creates a nice looking table, which was used as a basis for the final tables in the manuscript; however, it doesn't display SDs for the random effects, and does its own calculations using the lmer function, such that it doesn't always perfectly match the results of the function lmer_alt. Therefore, the values in the final tables come from the printed summaries of each LMM above, which are definitely the correct ones
+
+```{r tab model all components}
+tab_model(c(m_P1py_nest1b, m_N1_nest1b, m_N2_nest1b),  pred.labels=labels,
+          show.se=TRUE, show.stat=TRUE, show.ci = FALSE, string.se = "SE",
+          show.re.var=FALSE, show.obs=FALSE,
+          emph.p = T,p.style = "numeric_stars", 
+          string.stat = "t-value", string.p = "p-value", show.icc = FALSE,
+          show.loglik = T, show.dev = T, show.r2 = F, file = here("tables", "table_nest1b.html"))
+
+```
+
+
+# RT
+### RT as reported in Table 1
+```{r lmm RT}
+
+print (summary(
+  m_rt <- lmer_alt(RT ~ exp*lat*cat +
+                       (1 | VPNummer),
+                     data = trials_lat[trials_lat$ErrorCode == "255" & trials_lat$RTout == "0" & !is.na(trials_lat$N400py),],
+                          control = lmerControl(calc.derivs = FALSE,
+                          optimizer = "bobyqa", 
+                          optCtrl = list(maxfun = 2e5)))))
+
+```
+
+## tab model RT
+
+```{r}
+tab_model(c(m_rt),  pred.labels=labels,
+          show.se=TRUE, show.stat=TRUE, show.ci = FALSE, string.se = "SE",
+          show.re.var=T, show.obs=FALSE,
+          emph.p = T,p.style = "numeric_stars", 
+          string.stat = "t-value", string.p = "p-value", show.icc = FALSE,
+          show.loglik = T, show.dev = T, show.r2 = F, file = here::here("tables", "table_RT.html"))
+
+```
+
+
+### RT nested in Exp
+as reported in text
+
+```{r lmm RT exp/cat}
+
+print (summary(
+  m_rt_exp <- lmer_alt(RT ~ exp/cat +
+                       (1 | VPNummer),
+                     data = trials_lat[trials_lat$ErrorCode == "255" & trials_lat$RTout == "0" & !is.na(trials_lat$N400py),],
+                          control = lmerControl(calc.derivs = FALSE,
+                          optimizer = "bobyqa", 
+                          optCtrl = list(maxfun = 2e5)))))
+
+```
+
