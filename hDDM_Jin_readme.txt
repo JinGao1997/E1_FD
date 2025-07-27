@@ -1,0 +1,1 @@
+docker run -v C:\hDDM_Jin_lab:/home/jovyan/work -p 8888:8888 --memory 21G --oom-kill-disable --cpus 7 -it --rm hcp4715/hddm:latest jupyter notebook
