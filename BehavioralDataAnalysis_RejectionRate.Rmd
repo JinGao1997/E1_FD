@@ -1,0 +1,347 @@
+---
+title: "UG Task Behavioral Data Analysis - Rejection Rate"
+author: "Jin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+---
+
+``` {r setup, include=FALSE}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(car)
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+options(scipen = 10)
+dir.create("analysis_output/results_refuse/ratio", recursive = TRUE, showWarnings = FALSE)
+dir.create("analysis_output/results_refuse/type", recursive = TRUE, showWarnings = FALSE)
+````
+
+# 1. 数据导入与变量构建
+
+``` {r import-vars}
+data_path <- "E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/Offers__Behavior/BehaviorDataAnalysis/trials.csv"
+df_raw <- read_csv(data_path)
+df_raw <- df_raw %>%
+  mutate(
+    offer_ratio = factor(paste0(Offers_You, ":", Offers_Other),
+                         levels = c("5:5", "4:6", "3:7", "2:8", "1:9")),
+    offer_type = case_when(
+      paste0(Offers_You, ":", Offers_Other) %in% c("5:5", "4:6") ~ "fair",
+      paste0(Offers_You, ":", Offers_Other) %in% c("2:8", "1:9") ~ "unfair",
+      TRUE ~ "other"
+    ),
+    offer_type = factor(offer_type, levels = c("fair", "unfair", "other")),
+    reaction_bin_refuse = if_else(reaction == 2, 1L, 0L),  # 拒绝=1, 其他=0
+    emotion = factor(emotion, levels = c("dis", "dom", "neu", "aff", "enj")),
+    participant_id = factor(participant_id)
+  )
+glimpse(df_raw)
+```
+
+# 2. Ratio分析：**不删掉任何ratio**
+
+``` {r ratio-data}
+df_ratio <- df_raw %>%
+  filter(RT >= 150, RT <= 3000, !is.na(reaction)) %>%
+  filter(!is.na(offer_ratio)) %>%
+  mutate(
+    offer_ratio = droplevels(offer_ratio),
+    emotion = droplevels(emotion)
+  )
+table(df_ratio$emotion, df_ratio$offer_ratio)
+```
+
+# 3. Type分析：**只保留fair/unfair**
+
+``` {r type-data}
+df_type <- df_raw %>%
+  filter(RT >= 150, RT <= 3000, !is.na(reaction)) %>%
+  filter(offer_type %in% c("fair", "unfair")) %>%
+  mutate(
+    offer_type = droplevels(offer_type),
+    emotion = droplevels(emotion)
+  )
+table(df_type$emotion, df_type$offer_type)
+```
+
+---
+
+# Part 1. Ratio为自变量
+
+``` {r sum-coding-ratio}
+contrasts(df_ratio$emotion)     <- contr.sum(length(levels(df_ratio$emotion)))
+contrasts(df_ratio$offer_ratio) <- contr.sum(length(levels(df_ratio$offer_ratio)))
+```
+
+## 1. GLMM
+
+``` {r glmm-ratio}
+glmm_model_ratio_refuse <- glmer(
+  reaction_bin_refuse ~ emotion * offer_ratio + (1 | participant_id),
+  data   = df_ratio,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+glmm_anova_ratio_refuse <- car::Anova(glmm_model_ratio_refuse, type = "III", test.statistic = "Chisq")
+glmm_anova_ratio_refuse_df <- as.data.frame(glmm_anova_ratio_refuse)
+glmm_anova_ratio_refuse_df$Effect <- rownames(glmm_anova_ratio_refuse_df)
+glmm_anova_ratio_refuse_df <- glmm_anova_ratio_refuse_df[, c(ncol(glmm_anova_ratio_refuse_df), 1:(ncol(glmm_anova_ratio_refuse_df)-1))]
+write_csv(glmm_anova_ratio_refuse_df, "analysis_output/results_refuse/ratio/glmm_anova.csv")
+```
+
+## 2. 主效应边际均值
+
+``` {r glmm-marginals-ratio}
+emm_e_refuse <- emmeans(glmm_model_ratio_refuse, ~ emotion, type = "response")
+emm_e_eff_refuse <- contrast(emm_e_refuse, "eff")
+emm_o_refuse <- emmeans(glmm_model_ratio_refuse, ~ offer_ratio, type = "response")
+emm_o_eff_refuse <- contrast(emm_o_refuse, "eff")
+glmm_main_refuse <- bind_rows(
+  as.data.frame(emm_e_eff_refuse) %>% mutate(effect = "Emotion"),
+  as.data.frame(emm_o_eff_refuse) %>% mutate(effect = "OfferRatio")
+)
+write_csv(glmm_main_refuse, "analysis_output/results_refuse/ratio/glmm_main_effects.csv")
+```
+
+## 3. 后验对比（两两比较）
+
+``` {r glmm-posthoc-ratio}
+glmm_ph_by_ratio_refuse <- contrast(
+  emmeans(glmm_model_ratio_refuse, ~ emotion | offer_ratio, type = "response"),
+  method = "pairwise", adjust = "fdr"
+)
+write_csv(as.data.frame(summary(glmm_ph_by_ratio_refuse)), "analysis_output/results_refuse/ratio/glmm_posthoc_by_ratio.csv")
+glmm_ph_by_emotion_refuse <- contrast(
+  emmeans(glmm_model_ratio_refuse, ~ offer_ratio | emotion, type = "response"),
+  method = "pairwise", adjust = "fdr"
+)
+write_csv(as.data.frame(summary(glmm_ph_by_emotion_refuse)), "analysis_output/results_refuse/ratio/glmm_posthoc_by_emotion.csv")
+```
+
+## 4. 交互预测
+
+``` {r glmm-predictions-ratio}
+pred_glmm_refuse <- emmeans(glmm_model_ratio_refuse, ~ emotion * offer_ratio, type = "response")
+pred_df_refuse <- as.data.frame(pred_glmm_refuse)
+write_csv(pred_df_refuse, "analysis_output/results_refuse/ratio/glmm_interaction_preds.csv")
+```
+
+## 5. LMM: RT分析（不变）
+
+``` {r lmm-model-ratio}
+df_lmm <- df_ratio %>% mutate(logRT = log(RT))
+lmm_model_ratio <- lmer(
+  logRT ~ emotion * offer_ratio + (1 | participant_id),
+  data = df_lmm,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+lmm_anova_ratio <- anova(lmm_model_ratio, type = 3)
+lmm_anova_ratio_df <- as.data.frame(lmm_anova_ratio)
+lmm_anova_ratio_df$Effect <- rownames(lmm_anova_ratio_df)
+lmm_anova_ratio_df <- lmm_anova_ratio_df[, c(ncol(lmm_anova_ratio_df), 1:(ncol(lmm_anova_ratio_df)-1))]
+write_csv(lmm_anova_ratio_df, "analysis_output/results_refuse/ratio/lmm_anova.csv")
+```
+
+## 6. 主效应边际均值
+
+``` {r lmm-marginals-ratio}
+emm_e_lmm <- emmeans(lmm_model_ratio, ~ emotion)
+eff_e_lmm <- contrast(emm_e_lmm, "eff")
+emm_o_lmm <- emmeans(lmm_model_ratio, ~ offer_ratio)
+eff_o_lmm <- contrast(emm_o_lmm, "eff")
+lmm_main <- bind_rows(
+  as.data.frame(eff_e_lmm) %>% mutate(effect = "Emotion"),
+  as.data.frame(eff_o_lmm) %>% mutate(effect = "OfferRatio")
+)
+write_csv(lmm_main, "analysis_output/results_refuse/ratio/lmm_main_effects.csv")
+```
+
+## 7. 后验对比（两两比较）
+
+``` {r lmm-posthoc-ratio}
+lmm_ph_by_ratio <- contrast(
+  emmeans(lmm_model_ratio, ~ emotion | offer_ratio),
+  method = "pairwise", adjust = "fdr"
+)
+write_csv(as.data.frame(summary(lmm_ph_by_ratio)), "analysis_output/results_refuse/ratio/lmm_posthoc_by_ratio.csv")
+lmm_ph_by_emotion <- contrast(
+  emmeans(lmm_model_ratio, ~ offer_ratio | emotion),
+  method = "pairwise", adjust = "fdr"
+)
+write_csv(as.data.frame(summary(lmm_ph_by_emotion)), "analysis_output/results_refuse/ratio/lmm_posthoc_by_emotion.csv")
+```
+
+## 8. 交互预测（反转回毫秒）
+
+``` {r lmm-predictions-ratio}
+pred_lmm <- emmeans(lmm_model_ratio, ~ emotion * offer_ratio)
+pred_lmm_df <- as.data.frame(pred_lmm) %>%
+  rename(logRT_pred = emmean) %>%
+  mutate(
+    RT_pred_ms = exp(logRT_pred),
+    lower_ms   = exp(asymp.LCL),
+    upper_ms   = exp(asymp.UCL)
+  )
+write_csv(pred_lmm_df, "analysis_output/results_refuse/ratio/lmm_interaction_preds.csv")
+```
+
+---
+
+# Part 2. Type为自变量（仅fair/unfair）
+
+``` {r sum-coding-type}
+contrasts(df_type$emotion)     <- contr.sum(length(levels(df_type$emotion)))
+contrasts(df_type$offer_type)  <- contr.sum(length(levels(df_type$offer_type)))
+```
+
+## 1. GLMM
+
+``` {r glmm-type}
+glmm_model_type_refuse <- glmer(
+  reaction_bin_refuse ~ emotion * offer_type + (1 | participant_id),
+  data   = df_type,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+glmm_anova_type_refuse <- car::Anova(glmm_model_type_refuse, type = "III", test.statistic = "Chisq")
+glmm_anova_type_refuse_df <- as.data.frame(glmm_anova_type_refuse)
+glmm_anova_type_refuse_df$Effect <- rownames(glmm_anova_type_refuse_df)
+glmm_anova_type_refuse_df <- glmm_anova_type_refuse_df[, c(ncol(glmm_anova_type_refuse_df), 1:(ncol(glmm_anova_type_refuse_df)-1))]
+write_csv(glmm_anova_type_refuse_df, "analysis_output/results_refuse/type/glmm_anova.csv")
+```
+
+## 2. 主效应边际均值
+
+``` {r glmm-marginals-type}
+emm_e_type_refuse <- emmeans(glmm_model_type_refuse, ~ emotion, type = "response")
+emm_e_eff_type_refuse <- contrast(emm_e_type_refuse, "eff")
+emm_t_type_refuse <- emmeans(glmm_model_type_refuse, ~ offer_type, type = "response")
+emm_t_eff_type_refuse <- contrast(emm_t_type_refuse, "eff")
+glmm_main_type_refuse <- bind_rows(
+  as.data.frame(emm_e_eff_type_refuse) %>% mutate(effect = "Emotion"),
+  as.data.frame(emm_t_eff_type_refuse) %>% mutate(effect = "OfferType")
+)
+write_csv(glmm_main_type_refuse, "analysis_output/results_refuse/type/glmm_main_effects.csv")
+```
+
+## 3. 后验对比（两两比较）
+
+``` {r glmm-posthoc-type}
+glmm_ph_by_type_refuse <- contrast(
+  emmeans(glmm_model_type_refuse, ~ emotion | offer_type, type = "response"),
+  method = "pairwise", adjust = "fdr"
+)
+write_csv(as.data.frame(summary(glmm_ph_by_type_refuse)), "analysis_output/results_refuse/type/glmm_posthoc_by_type.csv")
+glmm_ph_by_emotion_type_refuse <- contrast(
+  emmeans(glmm_model_type_refuse, ~ offer_type | emotion, type = "response"),
+  method = "pairwise", adjust = "fdr"
+)
+write_csv(as.data.frame(summary(glmm_ph_by_emotion_type_refuse)), "analysis_output/results_refuse/type/glmm_posthoc_by_emotion.csv")
+```
+
+## 4. 交互预测
+
+``` {r glmm-predictions-type}
+pred_glmm_type_refuse <- emmeans(glmm_model_type_refuse, ~ emotion * offer_type, type = "response")
+pred_df_type_refuse <- as.data.frame(pred_glmm_type_refuse)
+write_csv(pred_df_type_refuse, "analysis_output/results_refuse/type/glmm_interaction_preds.csv")
+```
+
+## 5. LMM: RT分析
+
+``` {r lmm-model-type}
+df_lmm_type <- df_type %>% mutate(logRT = log(RT))
+lmm_model_type <- lmer(
+  logRT ~ emotion * offer_type + (1 | participant_id),
+  data = df_lmm_type,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+lmm_anova_type <- anova(lmm_model_type, type = 3)
+lmm_anova_type_df <- as.data.frame(lmm_anova_type)
+lmm_anova_type_df$Effect <- rownames(lmm_anova_type_df)
+lmm_anova_type_df <- lmm_anova_type_df[, c(ncol(lmm_anova_type_df), 1:(ncol(lmm_anova_type_df)-1))]
+write_csv(lmm_anova_type_df, "analysis_output/results_refuse/type/lmm_anova.csv")
+```
+
+## 6. 主效应边际均值
+
+``` {r lmm-marginals-type}
+emm_e_lmm_type <- emmeans(lmm_model_type, ~ emotion)
+eff_e_lmm_type <- contrast(emm_e_lmm_type, "eff")
+emm_t_lmm_type <- emmeans(lmm_model_type, ~ offer_type)
+eff_t_lmm_type <- contrast(emm_t_lmm_type, "eff")
+lmm_main_type <- bind_rows(
+  as.data.frame(eff_e_lmm_type) %>% mutate(effect = "Emotion"),
+  as.data.frame(eff_t_lmm_type) %>% mutate(effect = "OfferType")
+)
+write_csv(lmm_main_type, "analysis_output/results_refuse/type/lmm_main_effects.csv")
+```
+
+## 7. 后验对比（两两比较）
+
+``` {r lmm-posthoc-type}
+lmm_ph_by_type <- contrast(
+  emmeans(lmm_model_type, ~ emotion | offer_type),
+  method = "pairwise", adjust = "fdr"
+)
+write_csv(as.data.frame(summary(lmm_ph_by_type)), "analysis_output/results_refuse/type/lmm_posthoc_by_type.csv")
+lmm_ph_by_emotion_type <- contrast(
+  emmeans(lmm_model_type, ~ offer_type | emotion),
+  method = "pairwise", adjust = "fdr"
+)
+write_csv(as.data.frame(summary(lmm_ph_by_emotion_type)), "analysis_output/results_refuse/type/lmm_posthoc_by_emotion.csv")
+```
+
+## 8. 交互预测（反转回毫秒）
+
+``` {r lmm-predictions-type}
+pred_lmm_type <- emmeans(lmm_model_type, ~ emotion * offer_type)
+pred_lmm_type_df <- as.data.frame(pred_lmm_type) %>%
+  rename(logRT_pred = emmean) %>%
+  mutate(
+    RT_pred_ms = exp(logRT_pred),
+    lower_ms   = exp(asymp.LCL),
+    upper_ms   = exp(asymp.UCL)
+  )
+write_csv(pred_lmm_type_df, "analysis_output/results_refuse/type/lmm_interaction_preds.csv")
+```
+``` {r visualization}
+accept_ratio <- df_ratio %>%
+  group_by(participant_id, emotion, offer_ratio) %>%
+  summarize(rejection_rate = mean(reaction_bin_refuse, na.rm=TRUE), n_trials = n(), .groups="drop")
+write_csv(accept_ratio, "analysis_output/results_refuse/ratio/rejection_rate_by_subject.csv")
+
+accept_type <- df_type %>%
+  group_by(participant_id, emotion, offer_type) %>%
+  summarize(rejection_rate = mean(reaction_bin_refuse, na.rm=TRUE), n_trials = n(), .groups="drop")
+write_csv(accept_type, "analysis_output/results_refuse/type/rejection_rate_by_subject.csv")
+
+# Ratio分析：每被试每条件平均RT
+mean_rt_ratio <- df_ratio %>%
+  group_by(participant_id, emotion, offer_ratio) %>%
+  summarize(mean_rt = mean(RT, na.rm=TRUE), n_trials = n(), .groups="drop")
+write_csv(mean_rt_ratio, "analysis_output/results_refuse/ratio/mean_rt_by_subject.csv")
+
+# Type分析：每被试每条件平均RT
+mean_rt_type <- df_type %>%
+  group_by(participant_id, emotion, offer_type) %>%
+  summarize(mean_rt = mean(RT, na.rm=TRUE), n_trials = n(), .groups="drop")
+write_csv(mean_rt_type, "analysis_output/results_refuse/type/mean_rt_by_subject.csv")
+
+```
+
+
+# 结尾：Session Info
+
+``` {r session-info}
+sessionInfo()
+```
