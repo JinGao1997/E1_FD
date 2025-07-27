@@ -1,0 +1,790 @@
+---
+title: "EEG ERP Statistical Analysis"
+author: "JinGao"
+date: "2025-06-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999, digits = 6)
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  lme4, lmerTest, emmeans, DHARMa, ggplot2, dplyr, 
+  performance, tibble, broom.mixed, pROC, ggeffects, readxl, stringr
+)
+options(scipen = 999, digits = 6)
+options(contrasts = c("contr.sum", "contr.poly"))
+
+adjust_method <- "fdr"  # "fdr", "tukey", "bonferroni"
+
+```
+
+# ========== [1] 数据导入与预处理 ==========
+``` {r data-import}
+# Face phase
+data_face <- read.csv("E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/offerphase400600/face_phase/trials.csv", stringsAsFactors = FALSE)
+# Offer phase
+data_offer <- read.csv("E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/offerphase400600/offer_phase/trials.csv", stringsAsFactors = FALSE)
+
+# 生成 expressor 列
+data_face$expressor  <- str_extract(data_face$stim,  "(Fema\\d+|Male\\d+)")
+data_offer$expressor <- str_extract(data_offer$stim, "(Fema\\d+|Male\\d+)")
+
+# Offer类型自动识别
+calc_offer_type <- function(other, you) {
+  if (is.na(other) | is.na(you)) return(NA_character_)
+  pair <- paste0(as.integer(other), ":", as.integer(you))
+  if (pair %in% c("5:5", "6:4")) return("fair")
+  if (pair %in% c("8:2", "9:1")) return("unfair")
+  return("other")
+}
+data_offer$offer_type <- mapply(calc_offer_type, data_offer$Offers_Other, data_offer$Offers_You)
+data_offer$offer_type <- factor(data_offer$offer_type, levels = c("fair", "unfair", "other"))
+data_offer <- data_offer[data_offer$offer_type %in% c("fair", "unfair"), ]
+data_offer$offer_type <- droplevels(data_offer$offer_type)
+
+# 协变量导入与合并
+covariate_path <- "E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/data/SVO_PID5BF_PostRating.xlsx"
+covariate_cols <- c(
+  "participant_id", "SVO_angle", "Negative_Affectivity", "Detachment", "Antagonism",
+  "Disinhibition", "Anankastia", "Psychoticism", "Rating_1", "Rating_2", "Rating_3"
+)
+covariates <- read_excel(covariate_path)
+covariates <- covariates[, covariate_cols]
+covariates$participant_id <- as.character(covariates$participant_id)
+
+# 合并协变量
+data_face$participant_id  <- as.character(data_face$participant_id)
+data_offer$participant_id <- as.character(data_offer$participant_id)
+data_face  <- merge(data_face,  covariates, by = "participant_id", all.x = TRUE)
+data_offer <- merge(data_offer, covariates, by = "participant_id", all.x = TRUE)
+
+# 批量转numeric和z分数标准化
+covar_names <- setdiff(covariate_cols, "participant_id")
+for (v in covar_names) {
+  data_face[[v]]  <- as.numeric(data_face[[v]])
+  data_offer[[v]] <- as.numeric(data_offer[[v]])
+  data_face[[paste0(v, "_z")]]  <- scale(data_face[[v]])
+  data_offer[[paste0(v, "_z")]] <- scale(data_offer[[v]])
+}
+
+cat("协变量合并后，data_offer有缺失被试问卷：", sum(is.na(data_offer$SVO_angle)), "\n")
+cat("协变量合并后，data_face有缺失被试问卷：", sum(is.na(data_face$SVO_angle)), "\n")
+``` 
+
+``` {r overview}
+# 1. Face phase: 每被试每情绪的试次数
+face_trial_count <- as.data.frame(table(
+  Participant = data_face$participant_id,
+  Emotion = data_face$emotion
+))
+colnames(face_trial_count)[3] <- "Trial_Count"
+
+# 输出到face phase文件夹
+results_dir_face <- "E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/offerphase400600/face_phase/Results_Sta_LMM"
+if (!dir.exists(results_dir_face)) dir.create(results_dir_face, recursive = TRUE)
+write.csv(face_trial_count,
+          file.path(results_dir_face, "face_phase_trial_counts_by_condition.csv"),
+          row.names = FALSE)
+
+# 2. Offer phase: 每被试每情绪每offer类型每反应的试次数
+# 添加reaction标签
+data_offer$reaction_label <- factor(
+  data_offer$reaction,
+  levels = c(0, 1, 2),
+  labels = c("Miss", "Accept", "Reject")
+)
+
+offer_trial_count_full <- as.data.frame(table(
+  Participant = data_offer$participant_id,
+  Emotion = data_offer$emotion,
+  Offer_Type = data_offer$offer_type,
+  Reaction = data_offer$reaction_label
+))
+colnames(offer_trial_count_full)[5] <- "Trial_Count"
+
+# 输出到offer phase文件夹
+results_dir_offer <- "E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/offerphase400600/offer_phase/Results_Sta_LMM"
+if (!dir.exists(results_dir_offer)) dir.create(results_dir_offer, recursive = TRUE)
+write.csv(offer_trial_count_full,
+          file.path(results_dir_offer, "offer_phase_trial_counts_by_condition_reaction.csv"),
+          row.names = FALSE)
+
+# 如需控制台预览，亦可加以下两行：
+print(head(face_trial_count, 10))
+print(head(offer_trial_count_full, 10))
+
+``` 
+
+``` {r factor assign}
+# 分类变量设定
+data_face$participant_id <- factor(data_face$participant_id)
+data_face$setting        <- factor(data_face$setting)
+data_face$emotion        <- factor(data_face$emotion, levels = c("neu", "aff", "dis", "dom", "enj"))
+data_face$expressor      <- factor(data_face$expressor)
+contrasts(data_face$emotion) <- contr.sum(5)
+
+data_offer$participant_id <- factor(data_offer$participant_id)
+data_offer$setting        <- factor(data_offer$setting)
+data_offer$emotion        <- factor(data_offer$emotion, levels = c("neu", "aff", "dis", "dom", "enj"))
+data_offer$expressor      <- factor(data_offer$expressor)
+data_offer$offer_type     <- factor(data_offer$offer_type, levels = c("fair", "unfair"))
+contrasts(data_offer$offer_type) <- matrix(c(-0.5, 0.5), ncol=1)
+contrasts(data_offer$emotion)    <- contr.sum(5)
+data_offer$reaction_label <- factor(
+  data_offer$reaction,
+  levels = c(0, 1, 2),
+  labels = c("Miss", "Accept", "Reject")
+)
+data_offer$reaction_bin <- as.numeric(data_offer$reaction_label == "Accept") # 1=Accept, 0=Reject
+```
+
+# ========== [2] 公共函数定义 ==========
+``` {r public_functions}
+# 自动查找CI列名
+find_CI_columns <- function(df) {
+  patterns <- list(
+    c("lower.CL", "upper.CL"),
+    c("asymp.LCL", "asymp.UCL"),
+    c("LCL", "UCL"),
+    c("lower.HPD", "upper.HPD")
+  )
+  for (p in patterns) {
+    if (all(p %in% names(df))) return(p)
+  }
+  return(NULL)
+}
+
+# 结果自动报告主函数（适配主效应、交互显著等所有情形，英文段落）
+report_lmm_results <- function(
+  model, main1 = "emotion", main2 = NULL,
+  phase_label = "", erp_label = "", output_dir = ".", adjust_method="fdr"
+) {
+  anova_df <- tryCatch(as.data.frame(anova(model)), error = function(e) NULL)
+  msg_list <- c(); details <- ""; sig_main_any <- FALSE
+
+  all_effects <- rownames(anova_df)
+  intxn_names <- all_effects[grepl(":", all_effects)]
+  main_effects <- setdiff(all_effects, intxn_names)
+
+  # 检查交互项显著
+  if (length(intxn_names) > 0) {
+    highest_intxn <- intxn_names[length(intxn_names)]
+    intxn_p <- anova_df[highest_intxn, "Pr(>F)"]
+    if (!is.na(intxn_p) && intxn_p < 0.05) {
+      msg_list <- c(msg_list, sprintf(
+        "[Interaction] %s 显著, F(%s, %s)=%.2f, p=%.3f，输出simple effects与pairwise。",
+        highest_intxn,
+        anova_df[highest_intxn, "numDF"], anova_df[highest_intxn, "denDF"],
+        anova_df[highest_intxn, "F value"], intxn_p
+      ))
+      emm <- emmeans(model, as.formula(sprintf("~ %s | %s", main1, main2)))
+      pairs_main1_by_main2 <- as.data.frame(pairs(emm, by=main2, adjust=adjust_method))
+      pairs_main2_by_main1 <- as.data.frame(pairs(emm, by=main1, adjust=adjust_method))
+      write.csv(as.data.frame(emm), file.path(output_dir, sprintf("%s_%s_simple_effect_emmeans.csv", phase_label, erp_label)), row.names=FALSE)
+      write.csv(pairs_main1_by_main2, file.path(output_dir, sprintf("%s_%s_simple_effect_pairs_%s_by_%s.csv", phase_label, erp_label, main1, main2)), row.names=FALSE)
+      write.csv(pairs_main2_by_main1, file.path(output_dir, sprintf("%s_%s_simple_effect_pairs_%s_by_%s.csv", phase_label, erp_label, main2, main1)), row.names=FALSE)
+      details <- "交互显著，已输出simple effects与pairwise。"
+      writeLines(c(msg_list, details), file.path(output_dir, sprintf("%s_%s_auto_report.txt", phase_label, erp_label)))
+      return(invisible(list(msg=msg_list, details=details)))
+    }
+  }
+  # 若交互项不显著，检测并报告所有主效应
+  for (main in main_effects) {
+    if (main == "(Intercept)") next
+    p <- anova_df[main, "Pr(>F)"]
+    if (!is.na(p) && p < 0.05) {
+      sig_main_any <- TRUE
+      msg_list <- c(msg_list, sprintf(
+        "[Main Effect] %s 显著, F(%s, %s)=%.2f, p=%.3f。输出边际均值与pairwise。",
+        main,
+        anova_df[main, "numDF"], anova_df[main, "denDF"],
+        anova_df[main, "F value"], p
+      ))
+      emm <- emmeans(model, as.formula(sprintf("~ %s", main)))
+      pairs_res <- as.data.frame(pairs(emm, adjust=adjust_method))
+      write.csv(as.data.frame(emm), file.path(output_dir, sprintf("%s_%s_main_effect_emmeans_%s.csv", phase_label, erp_label, main)), row.names=FALSE)
+      write.csv(pairs_res, file.path(output_dir, sprintf("%s_%s_main_effect_pairs_%s.csv", phase_label, erp_label, main)), row.names=FALSE)
+    }
+  }
+  if (!sig_main_any) {
+    msg_list <- c(msg_list, "[Main Effect] 无显著主效应。")
+    details <- "模型检验完毕，未发现显著主效应或交互。"
+  } else {
+    details <- "交互项不显著，已自动检测并输出所有显著主效应和pairwise。"
+  }
+  writeLines(c(msg_list, details), file.path(output_dir, sprintf("%s_%s_auto_report.txt", phase_label, erp_label)))
+  invisible(list(msg=msg_list, details=details))
+}
+
+
+``` 
+
+# ========== [3] Face phase: LMM建模与标准报告 ==========
+``` {r face-phase-lmm}
+emotion_colors <- c('dis'="#755627",'dom'="#F5900C",'neu'="#C5C5C5EC",'aff'="#39E04F",'enj'="#FC0000")
+emotion_labels <- c('dis'='Disgust','dom'='Dominance','neu'='Neutral','aff'='Affiliative','enj'='Reward')
+
+results_dir_face <- "E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/offerphase400600/face_phase/Results_Sta_LMM"
+if (!dir.exists(results_dir_face)) dir.create(results_dir_face, recursive = TRUE)
+
+face_erp_vars <- c("P1", "N170", "EPN", "LPP_face")
+for (erp in face_erp_vars) {
+  cat("\n========== Face phase ERP: ", erp, " ==========\n")
+  df <- data_face[!is.na(data_face[[erp]]), ]
+  m1 <- lmer(
+    as.formula(paste0(erp, " ~ emotion + (1 | participant_id) + (1 | expressor)")),
+    data = df, REML = FALSE
+  )
+  m2 <- try(
+    lmer(
+      as.formula(paste0(erp, " ~ emotion + (1 + emotion | participant_id) + (1 | expressor)")),
+      data = df, REML = FALSE
+    ),
+    silent = TRUE
+  )
+  model <- if (!inherits(m2, "try-error") && !isSingular(m2) && AIC(m2) < AIC(m1)) m2 else m1
+  # 保存summary/anova/R2
+  sink(file.path(results_dir_face, paste0(erp, "_summary.txt")))
+  print(performance::r2(model))
+  print(summary(model))
+  print(anova(model))
+  sink()
+  write.csv(as.data.frame(performance::r2(model)), file.path(results_dir_face, paste0(erp, "_R2.csv")), row.names=FALSE)
+  write.csv(as.data.frame(anova(model)), file.path(results_dir_face, paste0(erp, "_anova.csv")), row.names=TRUE)
+  # 残差诊断
+  png(file.path(results_dir_face, paste0(erp, "_DHARMa.png")), width=800, height=800)
+  plot(DHARMa::simulateResiduals(model))
+  dev.off()
+  # 结果标准化自动报告与配对
+  report_lmm_results(model, main1="emotion", main2=NULL, phase_label="face", erp_label=erp, output_dir=results_dir_face, adjust_method=adjust_method)
+  # 可视化主效应边际均值
+  emm <- emmeans(model, ~ emotion)
+  emm_df <- as.data.frame(emm)
+  ci_cols <- find_CI_columns(emm_df)
+  if (!is.null(ci_cols)) {
+    emm_df$ci_lower <- emm_df[[ci_cols[1]]]
+    emm_df$ci_upper <- emm_df[[ci_cols[2]]]
+  } else {
+    emm_df$ci_lower <- emm_df$emmean - emm_df$SE
+    emm_df$ci_upper <- emm_df$emmean + emm_df$SE
+  }
+  p <- ggplot(emm_df, aes(x = emotion, y = emmean, color = emotion)) +
+    geom_point(size = 2) +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+    scale_color_manual(values = emotion_colors, breaks = names(emotion_labels), labels = emotion_labels) +
+    labs(title = paste0(erp, ": Marginal Means"), x = "Emotion", y = paste0(erp, " (μV)")) +
+    theme_minimal(base_size = 15)
+  ggsave(file.path(results_dir_face, paste0(erp, "_emmeans_plot.png")), plot = p, width = 6, height = 4, dpi = 300)
+}
+
+cat("全部Face phase成分分析、输出与可视化完毕！\n")
+
+```
+
+
+# ========== [4] Offer phase: LMM建模与标准报告 ==========
+``` {r offer-phase-lmm}
+results_dir_offer <- "E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/offerphase400600/offer_phase/Results_Sta_LMM"
+if (!dir.exists(results_dir_offer)) dir.create(results_dir_offer, recursive = TRUE)
+
+erp_vars <- c("FRN", "LPP_offer")
+emotion_colors <- c('dis'="#755627",'dom'="#F5900C",'neu'="#C5C5C5EC",'aff'="#39E04F",'enj'="#FC0000")
+emotion_labels <- c('dis'='Disgust','dom'='Dominance','neu'='Neutral','aff'='Affiliative','enj'='Reward')
+
+# Main model definitions
+all_models <- list(
+  emo_main        = "emotion + (1 | participant_id)",
+  offer_main      = "offer_type + (1 | participant_id)",
+  intxn           = "emotion * offer_type + (1 | participant_id)",
+  emo_offer_reac  = "emotion * offer_type + reaction_bin + (1 | participant_id)",
+  intxn_reac      = "emotion * offer_type * reaction_bin + (1 | participant_id)"
+)
+
+# Covariates (all z-scored)
+covariate_z_vars <- c("SVO_angle_z", "Negative_Affectivity_z", "Detachment_z", "Antagonism_z",
+                      "Disinhibition_z", "Anankastia_z", "Psychoticism_z",
+                      "Rating_1_z", "Rating_2_z", "Rating_3_z")
+allcov_formula <- paste0("emotion * offer_type + ", paste(covariate_z_vars, collapse=" + "), " + (1 | participant_id)")
+
+# Helper: Plot estimated marginal means
+plot_emmeans_marginal <- function(model, out_dir, erp, main1="emotion", main2=NULL, title_suffix="") {
+  fixed_vars <- all.vars(formula(model))
+  main1_in <- main1 %in% fixed_vars
+  main2_in <- !is.null(main2) && main2 %in% fixed_vars
+  if (main1_in && main2_in) {
+    emm <- emmeans(model, as.formula(sprintf("~ %s | %s", main1, main2)))
+    emm_df <- as.data.frame(emm)
+    ci_cols <- find_CI_columns(emm_df)
+    if (!is.null(ci_cols)) {
+      emm_df$ci_lower <- emm_df[[ci_cols[1]]]
+      emm_df$ci_upper <- emm_df[[ci_cols[2]]]
+    } else {
+      emm_df$ci_lower <- emm_df$emmean - emm_df$SE
+      emm_df$ci_upper <- emm_df$emmean + emm_df$SE
+    }
+    p <- ggplot(emm_df, aes_string(x=main2, y="emmean", group=main1, color=main1)) +
+      geom_point(position=position_dodge(0.3), size=2) +
+      geom_line(position=position_dodge(0.3), aes_string(linetype=main1)) +
+      geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.18, position=position_dodge(0.3)) +
+      scale_color_manual(values=emotion_colors, labels=emotion_labels) +
+      labs(title=sprintf("%s: Marginal Means%s", erp, title_suffix),
+           x=main2, y=paste(erp, "(μV)"), color="Emotion", linetype="Emotion") +
+      theme_minimal(base_size=15)
+    ggsave(file.path(out_dir, paste0("emmeans_plot_interaction.png")), plot=p, width=7, height=4, dpi=300)
+  } else if (main1_in) {
+    emm <- emmeans(model, as.formula(sprintf("~ %s", main1)))
+    emm_df <- as.data.frame(emm)
+    ci_cols <- find_CI_columns(emm_df)
+    if (!is.null(ci_cols)) {
+      emm_df$ci_lower <- emm_df[[ci_cols[1]]]
+      emm_df$ci_upper <- emm_df[[ci_cols[2]]]
+    } else {
+      emm_df$ci_lower <- emm_df$emmean - emm_df$SE
+      emm_df$ci_upper <- emm_df$emmean + emm_df$SE
+    }
+    p <- ggplot(emm_df, aes(x=.data[[main1]], y=emmean, color=.data[[main1]])) +
+      geom_point(size=2) +
+      geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.2) +
+      scale_color_manual(values=emotion_colors, breaks = names(emotion_labels), labels = emotion_labels) +
+      labs(title=sprintf("%s: Marginal Means%s", erp, title_suffix),
+           x=main1, y=paste0(erp, " (μV)")) +
+      theme_minimal(base_size=15)
+    ggsave(file.path(out_dir, paste0("emmeans_plot_main.png")), plot=p, width=7, height=4, dpi=300)
+  } else if (main2_in) {
+    emm <- emmeans(model, as.formula(sprintf("~ %s", main2)))
+    emm_df <- as.data.frame(emm)
+    ci_cols <- find_CI_columns(emm_df)
+    if (!is.null(ci_cols)) {
+      emm_df$ci_lower <- emm_df[[ci_cols[1]]]
+      emm_df$ci_upper <- emm_df[[ci_cols[2]]]
+    } else {
+      emm_df$ci_lower <- emm_df$emmean - emm_df$SE
+      emm_df$ci_upper <- emm_df$emmean + emm_df$SE
+    }
+    p <- ggplot(emm_df, aes(x=.data[[main2]], y=emmean, color=.data[[main2]])) +
+      geom_point(size=2) +
+      geom_errorbar(aes(ymin=ci_lower, ymax=ci_upper), width=0.2) +
+      labs(title=sprintf("%s: Marginal Means%s", erp, title_suffix),
+           x=main2, y=paste0(erp, " (μV)")) +
+      theme_minimal(base_size=15)
+    ggsave(file.path(out_dir, paste0("emmeans_plot_main2.png")), plot=p, width=7, height=4, dpi=300)
+  }
+}
+
+# 1. Fit all main models, save results, plot marginal means, store for comparison
+for (erp in erp_vars) {
+  model_compare_list <- list()
+  for (mod_name in names(all_models)) {
+    out_dir <- file.path(results_dir_offer, erp, mod_name)
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+    df <- data_offer[!is.na(data_offer[[erp]]) & data_offer$reaction_label %in% c("Accept", "Reject"), ]
+    model <- tryCatch({
+      lmer(as.formula(paste0(erp, " ~ ", all_models[[mod_name]])), data = df, REML = FALSE)
+    }, error = function(e) e, warning = function(w) w)
+    if (!(inherits(model, "error") || inherits(model, "warning") || isSingular(model))) {
+      model_compare_list[[mod_name]] <- model
+      # Output
+      sink(file.path(out_dir, "summary.txt"))
+      print(performance::r2(model))
+      print(summary(model))
+      print(anova(model))
+      sink()
+      write.csv(as.data.frame(performance::r2(model)), file.path(out_dir, "R2.csv"), row.names=FALSE)
+      write.csv(as.data.frame(anova(model)), file.path(out_dir, "anova.csv"), row.names=TRUE)
+      png(file.path(out_dir, "DHARMa.png"), width=800, height=800)
+      plot(DHARMa::simulateResiduals(model))
+      dev.off()
+      # ---------- 自动识别主效应/交互 ----------
+      # 如果模型是"offer_main"，自动main1="offer_type", main2=NULL，其它保持默认
+      if (mod_name == "offer_main") {
+        main1 <- "offer_type"; main2 <- NULL
+      } else if (mod_name == "emo_main") {
+        main1 <- "emotion"; main2 <- NULL
+      } else if (grepl("intxn", mod_name) | grepl("reac", mod_name)) {
+        main1 <- "emotion"; main2 <- "offer_type"
+      } else {
+        main1 <- "emotion"; main2 <- NULL
+      }
+      report_lmm_results(
+        model, main1=main1, main2=main2,
+        phase_label="offer", erp_label=paste0(erp, "_", mod_name),
+        output_dir=out_dir, adjust_method=adjust_method
+      )
+      plot_emmeans_marginal(model, out_dir, erp, main1, main2, title_suffix=sprintf(" [%s]", mod_name))
+    }
+  }
+
+  # 2. Model comparison table (AIC/BIC/R²)
+  comparison_df <- data.frame(
+    Model = character(), AIC = numeric(), BIC = numeric(),
+    R2m = numeric(), R2c = numeric(), stringsAsFactors=FALSE
+  )
+  for (nm in names(model_compare_list)) {
+    m <- model_compare_list[[nm]]
+    r2 <- performance::r2(m)
+    comparison_df <- rbind(comparison_df, data.frame(
+      Model = nm,
+      AIC = AIC(m),
+      BIC = BIC(m),
+      R2m = r2$R2_marginal,
+      R2c = r2$R2_conditional
+    ))
+  }
+  write.csv(comparison_df, file.path(results_dir_offer, erp, "model_comparison_main.csv"), row.names=FALSE)
+  print(comparison_df)
+}
+
+# 3. Batch single-covariate models
+for (erp in erp_vars) {
+  for (cov_z in covariate_z_vars) {
+    out_dir <- file.path(results_dir_offer, erp, paste0("covariate_", cov_z))
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+    df <- data_offer[!is.na(data_offer[[erp]]) & data_offer$reaction_label %in% c("Accept", "Reject"), ]
+    model_formula <- paste0(erp, " ~ emotion * offer_type + ", cov_z, " + (1 | participant_id)")
+    model <- tryCatch({
+      lmer(as.formula(model_formula), data = df, REML = FALSE)
+    }, error = function(e) e, warning = function(w) w)
+    if (!(inherits(model, "error") || inherits(model, "warning") || isSingular(model))) {
+      sink(file.path(out_dir, "summary.txt"))
+      print(performance::r2(model))
+      print(summary(model))
+      print(anova(model))
+      sink()
+      write.csv(as.data.frame(performance::r2(model)), file.path(out_dir, "R2.csv"), row.names=FALSE)
+      write.csv(as.data.frame(anova(model)), file.path(out_dir, "anova.csv"), row.names=TRUE)
+      png(file.path(out_dir, "DHARMa.png"), width=800, height=800)
+      plot(DHARMa::simulateResiduals(model))
+      dev.off()
+      report_lmm_results(model, main1="emotion", main2="offer_type", phase_label="offer", erp_label=paste0(erp, "_covariate_", cov_z), output_dir=out_dir, adjust_method=adjust_method)
+      plot_emmeans_marginal(model, out_dir, erp, main1="emotion", main2="offer_type", title_suffix=sprintf(" (Covariate: %s)", cov_z))
+    }
+  }
+}
+
+# 4. Full covariate model (all covariates)
+for (erp in erp_vars) {
+  out_dir <- file.path(results_dir_offer, erp, "allcovariates")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  df <- data_offer[!is.na(data_offer[[erp]]) & data_offer$reaction_label %in% c("Accept", "Reject"), ]
+  model <- tryCatch({
+    lmer(as.formula(paste0(erp, " ~ ", allcov_formula)), data = df, REML = FALSE)
+  }, error = function(e) e, warning = function(w) w)
+  if (!(inherits(model, "error") || inherits(model, "warning") || isSingular(model))) {
+    sink(file.path(out_dir, "summary.txt"))
+    print(performance::r2(model))
+    print(summary(model))
+    print(anova(model))
+    sink()
+    write.csv(as.data.frame(performance::r2(model)), file.path(out_dir, "R2.csv"), row.names=FALSE)
+    write.csv(as.data.frame(anova(model)), file.path(out_dir, "anova.csv"), row.names=TRUE)
+    broom::tidy(model) %>% write.csv(file.path(out_dir, "coefficients.csv"), row.names=FALSE)
+    png(file.path(out_dir, "DHARMa.png"), width=800, height=800)
+    plot(DHARMa::simulateResiduals(model))
+    dev.off()
+    report_lmm_results(model, main1="emotion", main2="offer_type", phase_label="offer", erp_label=paste0(erp, "_allcovariates"), output_dir=out_dir, adjust_method=adjust_method)
+    plot_emmeans_marginal(model, out_dir, erp, main1="emotion", main2="offer_type", title_suffix=" (All Covariates)")
+  }
+}
+
+cat("All Offer phase ERP LMM analyses with visualization and model comparison completed!\n")
+
+```
+# ========== [4.1] Fair Unfair only: LMM建模与标准报告 ==========
+``` {r offer-phase-lmm}
+# ========== [4.1] Fair/Unfair only: LPP_offer主效应+交互模型（pairwise结果完全区分）==========
+
+decision_colors <- c("Accept"="#39E04F", "Reject"="#FC0000") # Accept绿，Reject红
+emotion_colors <- c('neu'="#C5C5C5EC",'aff'="#39E04F",'dis'="#755627",'dom'="#F5900C",'enj'="#FC0000")
+emotion_labels <- c('neu'='Neutral','aff'='Affiliative','dis'='Disgust','dom'='Dominance','enj'='Reward')
+emotion_linetypes <- c("solid","dashed","dotted","dotdash","twodash")
+emotion_shapes <- c(16,17,15,18,19)
+adjust_method <- "fdr"
+
+# 工具函数
+find_CI_columns <- function(df) {
+  patterns <- list(
+    c("lower.CL", "upper.CL"),
+    c("asymp.LCL", "asymp.UCL"),
+    c("LCL", "UCL"),
+    c("lower.HPD", "upper.HPD")
+  )
+  for (p in patterns) if (all(p %in% names(df))) return(p)
+  return(NULL)
+}
+
+# 自动报告函数（自动判别显著性，分模型保存，绝不混用！）
+report_lmm_results <- function(
+  model, main1 = "emotion", main2 = NULL,
+  phase_label = "", erp_label = "", output_dir = ".", adjust_method="fdr"
+) {
+  anova_df <- tryCatch(as.data.frame(anova(model)), error = function(e) NULL)
+  msg <- ""; details <- ""; simple_emm <- NULL; simple_pairs <- NULL
+  in_model <- function(var) !is.null(anova_df) && var %in% rownames(anova_df)
+  main1_in <- in_model(main1)
+  main2_in <- !is.null(main2) && in_model(main2)
+  intxn_name <- if(main1_in && main2_in) paste(main1, main2, sep=":") else NULL
+  intxn_in <- !is.null(intxn_name) && intxn_name %in% rownames(anova_df)
+  main1_p <- if(main1_in) anova_df[main1, "Pr(>F)"] else NA
+  intxn_p <- if(intxn_in) anova_df[intxn_name, "Pr(>F)"] else NA
+
+  if (!is.null(anova_df)) {
+    if (intxn_in && !is.na(intxn_p) && intxn_p < 0.05) {
+      msg <- sprintf(
+        "[Interaction model] The %s × %s interaction was significant, F(%s, %s) = %.2f, p = %.3f. Simple effects (by-group) analyses below.",
+        main1, main2,
+        anova_df[intxn_name, "numDF"], anova_df[intxn_name, "denDF"],
+        anova_df[intxn_name, "F value"], intxn_p)
+      # 只保存simple effects和分组pairwise
+      emm <- emmeans(model, as.formula(sprintf("~ %s | %s", main1, main2)))
+      pairs_emotion_by_decision <- as.data.frame(pairs(emm, by=main2, adjust=adjust_method))
+      pairs_decision_by_emotion <- as.data.frame(pairs(emm, by=main1, adjust=adjust_method))
+      write.csv(as.data.frame(emm), file.path(output_dir, sprintf("%s_%s_simple_effect_emmeans.csv", phase_label, erp_label)), row.names=FALSE)
+      write.csv(pairs_emotion_by_decision, file.path(output_dir, sprintf("%s_%s_simple_effect_pairs_emotion_by_decision.csv", phase_label, erp_label)), row.names=FALSE)
+      write.csv(pairs_decision_by_emotion, file.path(output_dir, sprintf("%s_%s_simple_effect_pairs_decision_by_emotion.csv", phase_label, erp_label)), row.names=FALSE)
+      details <- "Simple effects (by-group) and pairwise (simple) results saved.";
+    } else if (main1_in && !is.na(main1_p) && main1_p < 0.05) {
+      msg <- sprintf(
+        "[Main effect model] There was a significant main effect of %s, F(%s, %s) = %.2f, p = %.3f (no interaction, p = %.3f).",
+        main1, anova_df[main1, "numDF"], anova_df[main1, "denDF"],
+        anova_df[main1, "F value"], main1_p, intxn_p)
+      emm <- emmeans(model, as.formula(sprintf("~ %s", main1)))
+      pairs_res <- as.data.frame(pairs(emm, adjust=adjust_method))
+      write.csv(as.data.frame(emm), file.path(output_dir, sprintf("%s_%s_main_effect_emmeans.csv", phase_label, erp_label)), row.names=FALSE)
+      write.csv(pairs_res, file.path(output_dir, sprintf("%s_%s_main_effect_pairs.csv", phase_label, erp_label)), row.names=FALSE)
+      details <- "Main effect model marginal means and pairwise results saved."
+    } else {
+      msg <- "[Main effect model] No significant effects found (neither main effect nor interaction)."
+      details <- "Model tested, but no effect reached significance."
+    }
+  } else {
+    msg <- "ANOVA table could not be computed for this model (possibly due to variable(s) missing or model degenerate)."
+    details <- "No results could be extracted."
+  }
+  outpath <- file.path(output_dir, sprintf("%s_%s_auto_report.txt", phase_label, erp_label))
+  writeLines(c(msg, details), outpath)
+  invisible(list(msg=msg, details=details))
+}
+
+# 主函数
+fit_and_report_lpp <- function(df, offer_cat = c("fair","unfair")) {
+  offer_cat <- match.arg(offer_cat)
+  base_dir <- file.path(results_dir_offer, "LPP_offer", ifelse(offer_cat=="fair","FairOnly","UnfairOnly"))
+  dir_main <- file.path(base_dir, "MainEffects"); dir.create(dir_main, recursive=TRUE, showWarnings=FALSE)
+  dir_int  <- file.path(base_dir, "Interaction"); dir.create(dir_int, recursive=TRUE, showWarnings=FALSE)
+
+  # ========== 主效应模型 ==========
+  df_sub <- subset(df, offer_type == offer_cat & !is.na(LPP_offer) & reaction_label %in% c("Accept", "Reject"))
+  df_sub$emotion <- factor(df_sub$emotion, levels=c("neu","aff","dis","dom","enj"))
+  df_sub$reaction_bin <- as.numeric(df_sub$reaction_label == "Accept")
+  df_sub$reaction_label <- factor(df_sub$reaction_label, levels=c("Accept", "Reject"))
+
+  model_main <- lmer(LPP_offer ~ emotion + reaction_bin + (1 | participant_id), data = df_sub, REML = FALSE)
+  sink(file.path(dir_main, "summary.txt")); print(performance::r2(model_main)); print(summary(model_main)); print(anova(model_main)); sink()
+  write.csv(as.data.frame(performance::r2(model_main)), file.path(dir_main, "R2.csv"), row.names=FALSE)
+  write.csv(as.data.frame(anova(model_main)), file.path(dir_main, "anova.csv"), row.names=TRUE)
+  broom.mixed::tidy(model_main) |> write.csv(file.path(dir_main, "coefficients.csv"), row.names=FALSE)
+  # 只保存主效应pairwise
+  report_lmm_results(model_main, main1="emotion", main2="reaction_bin", phase_label=offer_cat, erp_label="LPP_Main", output_dir=dir_main, adjust_method=adjust_method)
+  # 主效应可视化略（同前）
+
+  # ========== 交互模型 ==========
+  model_int <- lmer(LPP_offer ~ emotion * reaction_bin + (1 | participant_id), data = df_sub, REML = FALSE)
+  sink(file.path(dir_int, "summary.txt")); print(performance::r2(model_int)); print(summary(model_int)); print(anova(model_int)); sink()
+  write.csv(as.data.frame(performance::r2(model_int)), file.path(dir_int, "R2.csv"), row.names=FALSE)
+  write.csv(as.data.frame(anova(model_int)), file.path(dir_int, "anova.csv"), row.names=TRUE)
+  broom.mixed::tidy(model_int) |> write.csv(file.path(dir_int, "coefficients.csv"), row.names=FALSE)
+  # 只保存交互simple effects pairwise
+  report_lmm_results(model_int, main1="emotion", main2="reaction_bin", phase_label=offer_cat, erp_label="LPP_Interaction", output_dir=dir_int, adjust_method=adjust_method)
+  # 交互可视化略（同前）
+
+  # ========== 模型比较 ==========
+  comp_tab <- data.frame(
+    Model = c("MainEffects", "Interaction"),
+    AIC = c(AIC(model_main), AIC(model_int)),
+    BIC = c(BIC(model_main), BIC(model_int)),
+    R2m = c(performance::r2(model_main)$R2_marginal, performance::r2(model_int)$R2_marginal),
+    R2c = c(performance::r2(model_main)$R2_conditional, performance::r2(model_int)$R2_conditional)
+  )
+  write.csv(comp_tab, file.path(base_dir, "model_comparison.csv"), row.names=FALSE)
+  anova_out <- anova(model_main, model_int)
+  write.csv(as.data.frame(anova_out), file.path(base_dir, "anova_modelcompare.csv"))
+  cat(paste0("\n", toupper(offer_cat),"主效应/交互模型AIC/BIC对比:\n")); print(comp_tab); print(anova_out)
+}
+
+# ------------------ 主调用（Fair/Unfair分别）------------------
+fit_and_report_lpp(data_offer, offer_cat = "fair")
+fit_and_report_lpp(data_offer, offer_cat = "unfair")
+cat("FairOnly/UnfairOnly下主效应/交互模型全部自动建模、pairwise输出不混用、输出结构清晰！\n")
+
+
+``` 
+
+# # ----- 5. By-condition GLMM: emotion predicting accept rate (fair/unfair) -----
+# # ==== 0. 包与参数 ====
+# library(lme4)
+# library(emmeans)
+# library(performance)
+# library(DHARMa)
+# library(broom.mixed)
+# library(ggplot2)
+# library(knitr)
+# 
+# out_base <- "GLMM_by_cond"   # 结果主文件夹
+# dir.create(out_base, showWarnings=FALSE)
+# dharma_nsim <- 50            # 调试时建议小于100，正式分析可200+
+# set.seed(42)
+# 
+# # ==== 1. 主循环 ====
+# for (ot in c("fair", "unfair")) {
+#   out_dir <- file.path(out_base, ot)
+#   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+#   
+#   # ==== 1.1 数据准备 ====
+#   df_sub <- subset(
+#     data_offer, 
+#     offer_type == ot & reaction_label %in% c("Accept", "Reject")
+#   )
+#   df_sub$emotion <- factor(
+#     df_sub$emotion, 
+#     levels = c("neu","aff","dis","dom","enj"),
+#     labels = c("Neutral","Affiliative","Disgust","Dominance","Reward")
+#   )
+#   df_sub$reaction_bin <- as.numeric(df_sub$reaction_label == "Accept")
+#   n_sub <- nrow(df_sub)
+#   tbl <- table(df_sub$emotion, df_sub$reaction_label)
+#   
+#   cat(sprintf("\n[GLMM - %s] 样本量: %d\n", ot, n_sub))
+#   print(tbl)
+#   write.csv(tbl, file.path(out_dir, "trial_count_by_group.csv"))
+# 
+#   # ==== 1.2 样本量检查 ====
+#   if (any(tbl < 5)) {
+#     warning("某些emotion×reaction组合样本低于5，主结果需谨慎解读。")
+#     writeLines(paste("低样本组:\n", capture.output(print(tbl))),
+#                file.path(out_dir, "WARNING_low_sample.txt"))
+#   }
+# 
+#   # ==== 1.3 GLMM模型拟合 ====
+#   model_glmm <- tryCatch({
+#     glmer(
+#       reaction_bin ~ emotion + (1 | participant_id), 
+#       data = df_sub, 
+#       family = binomial, 
+#       control = glmerControl(optimizer="bobyqa")
+#     )
+#   }, error=function(e) {
+#     message("模型拟合失败: ", e$message)
+#     writeLines(e$message, file.path(out_dir, "ERROR_model_fit.txt"))
+#     return(NULL)
+#   })
+# 
+#   if (is.null(model_glmm)) next
+# 
+#   # ==== 1.4 结果保存 ====
+#   sink(file.path(out_dir, "summary.txt"))
+#   print(summary(model_glmm))
+#   print(performance::r2(model_glmm))
+#   print(anova(model_glmm))
+#   sink()
+#   broom.mixed::tidy(model_glmm) |> write.csv(file.path(out_dir, "coefficients.csv"), row.names=FALSE)
+# 
+#   # ==== 1.5 模型诊断 ====
+#   png(file.path(out_dir, "DHARMa.png"), width=800, height=800)
+#   dharma_res <- DHARMa::simulateResiduals(model_glmm, n = dharma_nsim)
+#   plot(dharma_res)
+#   # 保存outlier测试结果
+#   test_out <- capture.output(
+#     try(DHARMa::testOutliers(dharma_res, type="bootstrap"), silent=TRUE)
+#   )
+#   writeLines(test_out, file.path(out_dir, "DHARMa_testOutliers.txt"))
+#   dev.off()
+# 
+#   # ==== 1.6 边际均值和配对比较 ====
+#   emm <- emmeans(model_glmm, ~ emotion, type="response")
+#   pairs_emm <- pairs(emm, adjust = "fdr")
+#   write.csv(as.data.frame(emm), file.path(out_dir, "emmeans.csv"), row.names=FALSE)
+#   write.csv(as.data.frame(pairs_emm), file.path(out_dir, "emmeans_pairs.csv"), row.names=FALSE)
+#   # 简单可视化
+#   emm_df <- as.data.frame(emm)
+#   gg <- ggplot(emm_df, aes(x=emotion, y=prob)) +
+#     geom_point(size=2) +
+#     geom_errorbar(aes(ymin=asymp.LCL, ymax=asymp.UCL), width=0.18) +
+#     labs(title=paste0("Predicted Accept Rate by Emotion (", ot, ")"),
+#          x="Emotion", y="Predicted Accept Rate") +
+#     theme_minimal(base_size=15)
+#   ggsave(file.path(out_dir, "emmeans_plot.png"), gg, width=6, height=4, dpi=300)
+# 
+#   # ==== 1.7 Bootstrap敏感性分析 ====
+#   boot_out <- bootMer(model_glmm, FUN = fixef, nsim = 1000, seed = 42)
+#   boot_coef <- as.data.frame(boot_out$t)
+#   colnames(boot_coef) <- names(fixef(model_glmm))
+#   boot_summary <- as.data.frame(t(apply(boot_coef, 2, function(x) c(
+#     mean = mean(x, na.rm=TRUE),
+#     sd = sd(x, na.rm=TRUE),
+#     CI_2.5 = quantile(x, 0.025, na.rm=TRUE),
+#     CI_97.5 = quantile(x, 0.975, na.rm=TRUE)
+#   ))))
+#   boot_summary$MainModel <- fixef(model_glmm)
+#   boot_summary$Robust <- with(boot_summary, MainModel >= CI_2.5 & MainModel <= CI_97.5)
+#   boot_summary$Robust_Nonzero <- with(boot_summary, CI_2.5 * CI_97.5 > 0)
+#   boot_summary$Term <- rownames(boot_summary)
+#   rownames(boot_summary) <- NULL
+#   write.csv(boot_summary, file.path(out_dir, "bootstrapped_coefficients_summary.csv"), row.names=FALSE)
+#   write.csv(boot_coef, file.path(out_dir, "boot_coef_matrix.csv"), row.names=FALSE)
+# 
+#   # ==== 1.8 Bootstrap参数分布可视化 ====
+#   for (ti in 1:nrow(boot_summary)) {
+#     this_term <- boot_summary$Term[ti]
+#     this_vec <- boot_coef[[this_term]]
+#     if (all(is.na(this_vec)) || length(na.omit(this_vec)) == 0) {
+#       message(sprintf("跳过画图：%s全是NA", this_term))
+#       next
+#     }
+#     main_pt <- boot_summary$MainModel[ti]
+#     CI2.5 <- boot_summary$CI_2.5[ti]
+#     CI97.5 <- boot_summary$CI_97.5[ti]
+#     try({
+#       gg <- ggplot(data.frame(val=this_vec), aes(x=val)) +
+#         geom_histogram(bins=40, fill="skyblue", alpha=0.8) +
+#         geom_vline(xintercept=main_pt, color="red", linetype="dashed", size=1) +
+#         geom_vline(xintercept=c(CI2.5, CI97.5), color="black", linetype="dotted") +
+#         labs(title=paste0(this_term, ": Bootstrapped Estimates (", ot, ")"),
+#              x="Coefficient (logit)", y="Frequency",
+#              subtitle=sprintf("Main model: %.3f, 95%% boot CI: [%.3f, %.3f]", main_pt, CI2.5, CI97.5)) +
+#         theme_minimal(base_size=13)
+#       ggsave(file.path(out_dir, paste0("boot_",this_term,"_hist.png")), gg, width=6, height=3.2)
+#     }, silent=TRUE)
+#   }
+# 
+#   # ==== 1.9 自动生成Markdown小结 ====
+#   md_file <- file.path(out_dir, "boot_summary.md")
+#   have_cols <- intersect(c("Term","MainModel","mean","sd","CI_2.5","CI_97.5","Robust","Robust_Nonzero"), colnames(boot_summary))
+#   if (length(have_cols)>0) {
+#     kable_md <- knitr::kable(
+#       boot_summary[,have_cols,drop=FALSE],
+#       format="markdown", digits=3, caption=sprintf("GLMM Bootstrapping summary (%s)", ot)
+#     )
+#     cat("# GLMM Bootstrapping Sensitivity Analysis\n", file=md_file)
+#     cat(sprintf("**Condition:** %s only\n\n", ot), file=md_file, append=TRUE)
+#     cat("表格总结了bootstrap均值、95%%CI、健壮性（主模型点估计是否落在bootstrap区间内）、以及区间是否不跨零：\n\n", file=md_file, append=TRUE)
+#     cat(kable_md, file=md_file, append=TRUE)
+#     n_robust <- sum(boot_summary$Robust, na.rm=TRUE)
+#     total_terms <- nrow(boot_summary)
+#     n_nonzero <- sum(boot_summary$Robust_Nonzero, na.rm=TRUE)
+#     cat(sprintf("\n\n**%d/%d参数对抽样健壮；%d/%d参数区间不跨零。**\n", n_robust, total_terms, n_nonzero, total_terms), file=md_file, append=TRUE)
+#     for (i in 1:nrow(boot_summary)) {
+#       cat(sprintf("- *%s*: main=%.3f, 95%% boot CI=[%.3f, %.3f], robust=%s, 不跨零=%s\n",
+#                   boot_summary$Term[i],
+#                   boot_summary$MainModel[i],
+#                   boot_summary$CI_2.5[i], boot_summary$CI_97.5[i],
+#                   ifelse(boot_summary$Robust[i],"是","否"),
+#                   ifelse(boot_summary$Robust_Nonzero[i],"是","否")),
+#           file=md_file, append=TRUE)
+#     }
+#   }
+# }
+
+```
+

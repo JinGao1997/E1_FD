@@ -1,0 +1,391 @@
+---
+title: "EEG Predictors of Rejection Behavior in Unfair Ultimatum Game"
+author: "Jin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+---
+
+# 0. 脚本说明
+- **目的**：系统分析EEG成分（LPP、FRN）能否、如何预测不公平UG条件下的拒绝概率，并检验其在不同emotion条件下的作用模式。
+- **涵盖内容**：数据准备、主效应/交互GLMM、敏感性检验、可视化（含每条件试次分布）。
+---
+
+# 1. 数据导入与变量准备
+
+``` {r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(dplyr)
+library(stringr)
+library(readr)
+library(lme4)
+library(emmeans)
+library(ggplot2)
+library(ggthemes)
+library(knitr)
+library(boot)
+````
+
+``` {r data-import}
+main_out_dir <- "E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/offerphase400800/offer_phase/BrainBehavior_Rela"
+out_dir <- file.path(main_out_dir, "Unfair")
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+data_offer <- read.csv(file.path(main_out_dir, "../trials.csv"), stringsAsFactors = FALSE)
+data_offer$expressor <- stringr::str_extract(data_offer$stim, "(Fema\\d+|Male\\d+)")
+# Offer类型划分
+calc_offer_type <- function(other, you) {
+  if (is.na(other) | is.na(you)) return(NA_character_)
+  pair <- paste0(as.integer(other), ":", as.integer(you))
+  if (pair %in% c("5:5", "6:4")) return("fair")
+  if (pair %in% c("8:2", "9:1")) return("unfair")
+  return("other")
+}
+data_offer$offer_type <- mapply(calc_offer_type, data_offer$Offers_Other, data_offer$Offers_You)
+data_offer <- data_offer[data_offer$offer_type == "unfair", ]
+data_offer$offer_type <- factor(data_offer$offer_type)
+
+# 标准化变量、二元行为变量
+data_offer <- data_offer %>%
+  mutate(
+    participant_id = factor(participant_id),
+    emotion        = factor(emotion, levels = c("neu", "aff", "dis", "dom", "enj")),
+    expressor      = factor(expressor),
+    reaction_label = factor(reaction, levels = c(0, 1, 2), labels = c("Miss", "Accept", "Reject")),
+    reaction_bin   = as.numeric(reaction_label == "Accept"),
+    LPP_offer_z    = as.numeric(scale(LPP_offer)),
+    FRN_z          = as.numeric(scale(FRN)),
+    reaction_bin_refuse = as.numeric(reaction_bin == 0) # 1=Reject
+  ) %>% na.omit()
+
+write.csv(data_offer, file.path(out_dir, "Data_Offer_Clean.csv"), row.names = FALSE)
+```
+
+---
+
+# 2. GLMM建模：LPP/FRN主效应+交互作用
+
+``` {r glmm-models}
+# LPP主效应
+glmm_lpp <- glmer(
+  reaction_bin_refuse ~ LPP_offer_z + emotion + (1 | participant_id),
+  data = data_offer, family = binomial
+)
+# 随机截距+斜率模型（允许LPP效应跨被试变异）
+glmm_lpp_rs <- glmer(
+  reaction_bin_refuse ~ LPP_offer_z + emotion + (1 + LPP_offer_z | participant_id),
+  data = data_offer, family = binomial,
+  control = glmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+)
+# LPP × emotion 交互（随机斜率）
+glmm_lpp_int <- glmer(
+  reaction_bin_refuse ~ LPP_offer_z * emotion + (1 + LPP_offer_z | participant_id),
+  data = data_offer, family = binomial,
+  control = glmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+)
+# FRN主效应
+glmm_frn <- glmer(
+  reaction_bin_refuse ~ FRN_z + emotion + (1 | participant_id),
+  data = data_offer, family = binomial
+)
+glmm_frn_rs <- glmer(
+  reaction_bin_refuse ~ FRN_z + emotion + (1 + FRN_z | participant_id),
+  data = data_offer, family = binomial,
+  control = glmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+)
+# FRN × emotion 交互（随机斜率）
+glmm_frn_int <- glmer(
+  reaction_bin_refuse ~ FRN_z * emotion + (1 + FRN_z | participant_id),
+  data = data_offer, family = binomial,
+  control = glmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+)
+
+# 输出摘要
+sink(file.path(out_dir, "GLMM_LPP_RS_summary.txt")); print(summary(glmm_lpp_rs)); sink()
+sink(file.path(out_dir, "GLMM_FRN_RS_summary.txt")); print(summary(glmm_frn_rs)); sink()
+
+# 模型比较（主效应+交互+随机斜率全部纳入）
+modinfo <- data.frame(
+  Model = c("LPP_main", "LPP_main_RS", "LPP_interaction",
+            "FRN_main", "FRN_main_RS", "FRN_interaction"),
+  AIC = c(AIC(glmm_lpp), AIC(glmm_lpp_rs), AIC(glmm_lpp_int),
+          AIC(glmm_frn), AIC(glmm_frn_rs), AIC(glmm_frn_int)),
+  n_Trials = rep(nrow(data_offer), 6),
+  n_Subjects = rep(length(unique(data_offer$participant_id)), 6)
+)
+write.csv(modinfo, file.path(out_dir, "Model_Fit_Summary.csv"), row.names = FALSE)
+
+```
+
+# 2.1 模型比较
+``` {r glmm-models}
+# 模型AIC比较
+aic_table <- data.frame(
+  Model = c("LPP_main", "LPP_main_RS", "LPP_interaction",
+            "FRN_main", "FRN_main_RS", "FRN_interaction"),
+  AIC = c(AIC(glmm_lpp), AIC(glmm_lpp_rs), AIC(glmm_lpp_int),
+          AIC(glmm_frn), AIC(glmm_frn_rs), AIC(glmm_frn_int))
+)
+aic_table$DeltaAIC <- aic_table$AIC - min(aic_table$AIC)
+
+# R²
+library(performance)
+r2_tab <- data.frame(
+  Model = aic_table$Model,
+  R2_marginal = c(
+    r2(glmm_lpp)$R2_marginal, r2(glmm_lpp_rs)$R2_marginal, r2(glmm_lpp_int)$R2_marginal,
+    r2(glmm_frn)$R2_marginal, r2(glmm_frn_rs)$R2_marginal, r2(glmm_frn_int)$R2_marginal
+  ),
+  R2_conditional = c(
+    r2(glmm_lpp)$R2_conditional, r2(glmm_lpp_rs)$R2_conditional, r2(glmm_lpp_int)$R2_conditional,
+    r2(glmm_frn)$R2_conditional, r2(glmm_frn_rs)$R2_conditional, r2(glmm_frn_int)$R2_conditional
+  )
+)
+
+# 合并输出
+model_comp <- merge(aic_table, r2_tab, by="Model")
+write.csv(model_comp, file.path(out_dir, "Model_Comparison_AIC_R2.csv"), row.names=FALSE)
+
+# 保留必要列（可省略，确保顺序无误即可）
+model_comp <- model_comp[, c("Model", "AIC", "DeltaAIC", "R2_marginal", "R2_conditional")]
+
+# 2. 绘制AIC条形图
+library(ggplot2)
+p_aic <- ggplot(model_comp, aes(x=Model, y=AIC)) +
+  geom_bar(stat="identity", fill="#1f78b4", width=0.7) +
+  geom_text(aes(label=round(AIC,1)), vjust=-0.6, size=5) +
+  labs(title="Model Comparison (AIC)", x="Model", y="AIC") +
+  theme_minimal(base_size = 18) +
+  theme(
+    axis.text.x = element_text(angle=20, hjust=1, vjust=1),
+    plot.title = element_text(hjust=0.5, face="bold")
+  )
+
+ggsave(file.path(out_dir, "Model_Comparison_AIC.png"), p_aic, width=11, height=7)
+
+# 3. 长表转换（用tidyr，无需reshape2）
+library(tidyr)
+model_comp_long <- pivot_longer(
+  model_comp,
+  cols = c("R2_marginal", "R2_conditional"),
+  names_to = "R2_Type",
+  values_to = "R2_Value"
+)
+print(model_comp_long)
+
+# 4. 绘制R²条形图（用新的长表）
+p_r2 <- ggplot(model_comp_long, aes(x=Model, y=R2_Value, fill=R2_Type)) +
+  geom_bar(stat="identity", position="dodge") +
+  labs(title="Model R² (Marginal vs Conditional)", x="Model", y="R²", fill="R² Type") +
+  theme_minimal(base_size = 18) +
+  theme(
+    axis.text.x = element_text(angle=20, hjust=1, vjust=1),
+    plot.title = element_text(hjust=0.5, face="bold"),
+    legend.position = "top",
+    legend.title = element_text(size=14, face="bold")
+  )
+
+ggsave(file.path(out_dir, "Model_Comparison_R2.png"), p_r2, width=12, height=7)
+
+```
+
+# 3. 敏感性检验：Profile/Bootstrap CI、随机斜率
+``` {r sensitivity-checks}
+# --- Profile CI ---
+prof_ci_lpp <- confint(glmm_lpp, parm="LPP_offer_z", method="profile")
+prof_ci_frn <- confint(glmm_frn, parm="FRN_z", method="profile")
+
+# --- Bootstrap CI ---
+fixef_fun <- function(fit) fixef(fit)
+set.seed(42)
+boot_lpp <- bootMer(glmm_lpp, fixef_fun, nsim=1000, seed=42, type="parametric")
+boot_ci_lpp <- apply(boot_lpp$t, 2, quantile, probs = c(0.025, 0.975))
+boot_frn <- bootMer(glmm_frn, fixef_fun, nsim=1000, seed=42, type="parametric")
+boot_ci_frn <- apply(boot_frn$t, 2, quantile, probs = c(0.025, 0.975))
+write.csv(boot_ci_lpp, file.path(out_dir, "GLMM_fixed_LPP_bootstrap_CI.csv"))
+write.csv(boot_ci_frn, file.path(out_dir, "GLMM_fixed_FRN_bootstrap_CI.csv"))
+write.csv(prof_ci_lpp, file.path(out_dir, "GLMM_fixed_LPP_profile_CI.csv"))
+write.csv(prof_ci_frn, file.path(out_dir, "GLMM_fixed_FRN_profile_CI.csv"))
+```  
+
+
+---
+
+# 5. 可视化（用于敏感性报告、补充材料）
+``` {r trial-dist}
+# ============ 全局变量设置 ============ #
+emotion_labels <- c('neu'='Neutral','aff'='Affiliative','dis'='Disgust','dom'='Dominance','enj'='Reward')
+emotion_colors <- c('neu'="#C5C5C5EC",'aff'="#39E04F",'dis'="#755627",'dom'="#F5900C",'enj'="#FC0000")
+response_colors <- c("Accept"="#38a3a5", "Reject"="#e76f51")
+ordered_emotion_levels <- c('Neutral','Affiliative','Disgust','Dominance','Reward')
+
+# 主效应模型的LPP预测（全情绪平均）
+lpp_seq <- seq(min(data_offer$LPP_offer_z), max(data_offer$LPP_offer_z), length.out = 60)
+emm_lpp_main <- emmeans(glmm_lpp, ~ LPP_offer_z, at = list(LPP_offer_z = lpp_seq), type = "response")
+emm_lpp_main_df <- as.data.frame(emm_lpp_main)
+
+p_lpp_main <- ggplot(emm_lpp_main_df, aes(x = LPP_offer_z, y = prob)) +
+  geom_line(size = 1.4, color = "#1f78b4") +
+  geom_ribbon(aes(ymin = asymp.LCL, ymax = asymp.UCL), alpha = 0.20, fill = "#1f78b4", color = NA) +
+  labs(title = "LPP Predicts Rejection Probability (Main Effect Model)", 
+       x = "LPP (z-score)", y = "Rejection Probability") +
+  theme_minimal(base_size = 16)
+ggsave(file.path(out_dir, "LPP_MainEffect_Predict_Rejection.tif"), p_lpp_main, width = 9, height = 6, dpi = 450)
+p_lpp_main
+
+# 生成LPP预测序列
+lpp_seq <- seq(min(data_offer$LPP_offer_z), max(data_offer$LPP_offer_z), length.out = 60)
+
+# 用emmeans做主效应模型的条件预测
+emm_lpp_main <- emmeans(
+  glmm_lpp,
+  ~ LPP_offer_z | emotion,  # 注意不是交互，而是主效应模型下的不同组截距
+  at = list(LPP_offer_z = lpp_seq),
+  type = "response"
+)
+emm_lpp_main_df <- as.data.frame(emm_lpp_main)
+emm_lpp_main_df$emotion <- factor(emm_lpp_main_df$emotion, levels = c("neu","aff","dis","dom","enj"))
+
+# 可视化，每种情绪一条线（斜率一致，截距不同）
+p_lpp_main <- ggplot(emm_lpp_main_df, aes(x = LPP_offer_z, y = prob, color = emotion, fill = emotion)) +
+  geom_line(size = 1.3) +
+  geom_ribbon(aes(ymin = asymp.LCL, ymax = asymp.UCL), alpha = 0.18, color = NA) +
+  scale_color_manual(values = emotion_colors, labels = emotion_labels) +
+  scale_fill_manual(values = emotion_colors, guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1.05)) +
+  labs(title = "LPP Predicts Rejection Probability by Emotion (Main Effect Model)", 
+       x = "LPP (z-score)", y = "Rejection Probability", color = "Emotion") +
+  theme_minimal(base_size = 16)
+ggsave(file.path(out_dir, "LPP_MainEffect_by_Emotion.tif"), p_lpp_main, width = 10, height = 6.5, dpi = 450)
+p_lpp_main
+
+
+# ============ 2. 各emotion × response试次数分布（箱线图+散点） ============ #
+cell_counts <- data_offer %>%
+  mutate(accept = ifelse(reaction_bin == 1, "Accept", "Reject")) %>%
+  group_by(participant_id, emotion, accept) %>%
+  summarise(n_trials = n(), .groups = "drop")
+
+cat("各emotion × response试次数分布：\n")
+print(table(cell_counts$emotion, cell_counts$accept))
+
+p_trials <- ggplot(cell_counts, aes(x = emotion, y = n_trials, fill = accept)) +
+  geom_boxplot(alpha = 0.38, position = position_dodge(width = 0.62), outlier.shape = NA) +
+  geom_jitter(
+    aes(color = accept), 
+    size = 1.4, alpha = 0.68, 
+    position = position_jitterdodge(jitter.width = 0.09, dodge.width = 0.62)
+  ) +
+  scale_fill_manual(values = response_colors) +
+  scale_color_manual(values = response_colors) +
+  scale_x_discrete(labels = emotion_labels) +
+  labs(
+    title = "Per-subject trial counts by Emotion × Response (Unfair offers only)",
+    y = "Trial Count", x = "Emotion", fill = "Response", color = "Response"
+  ) +
+  theme_minimal(base_size = 15)
+ggsave(file.path(out_dir, "Boxplot_Trials_by_Emotion_Response.tif"), p_trials, width = 9, height = 6, dpi = 350)
+
+# ============ 3. Ridge plot：每种emotion下Accept/Reject试次数分布 ============ #
+emotion_colors <- c(
+  'Neutral'="#C5C5C5EC",
+  'Affiliative'="#39E04F",
+  'Disgust'="#755627",
+  'Dominance'="#F5900C",
+  'Reward'="#FC0000"
+)
+library(ggridges)
+max_trial <- 48
+x_breaks <- seq(0, max_trial, by=8)
+if (max_trial != tail(x_breaks, 1)) x_breaks <- c(x_breaks, max_trial)
+
+cell_counts_ridge <- data_offer %>%
+  mutate(
+    accept = ifelse(reaction_bin == 1, "Accept", "Reject"),
+    emotion_chr = emotion_labels[as.character(emotion)],
+    emotion = factor(emotion_chr, levels = ordered_emotion_levels)
+  ) %>%
+  group_by(participant_id, emotion, accept) %>%
+  summarise(n_trials = n(), .groups = "drop")
+
+# Accept ridge
+cell_accept <- cell_counts_ridge %>% filter(accept == "Accept")
+p_accept <- ggplot(cell_accept, aes(x = n_trials, y = emotion, fill = emotion)) +
+  ggridges::geom_density_ridges(
+    alpha = 0.82, scale = 1.06, color = "#444444",
+    jittered_points = TRUE, 
+    point_shape = "|", 
+    point_size = 2.0, 
+    point_alpha = 0.78,
+    bandwidth = 2.0
+  ) +
+  scale_fill_manual(values = emotion_colors, guide = "legend") +
+  scale_y_discrete(limits = rev(ordered_emotion_levels)) +
+  scale_x_continuous(
+    limits = c(0, max_trial),
+    breaks = x_breaks,
+    expand = c(0, 0.5)
+  ) +
+  labs(
+    title = "Unfair Offer: Trial Count Distribution (Accept, by Emotion)",
+    x = "Trial Count per Subject", y = "Emotion"
+  ) +
+  theme_ridges(font_size = 13, grid = TRUE) +
+  theme(legend.position = "right")
+
+# Reject ridge
+cell_reject <- cell_counts_ridge %>% filter(accept == "Reject")
+p_reject <- ggplot(cell_reject, aes(x = n_trials, y = emotion, fill = emotion)) +
+  ggridges::geom_density_ridges(
+    alpha = 0.82, scale = 1.06, color = "#444444",
+    jittered_points = TRUE, 
+    point_shape = "|", 
+    point_size = 2.0, 
+    point_alpha = 0.78,
+    bandwidth = 2.0
+  ) +
+  scale_fill_manual(values = emotion_colors, guide = "legend") +
+  scale_y_discrete(limits = rev(ordered_emotion_levels)) +
+  scale_x_continuous(
+    limits = c(0, max_trial),
+    breaks = x_breaks,
+    expand = c(0, 0.5)
+  ) +
+  labs(
+    title = "Unfair Offer: Trial Count Distribution (Reject, by Emotion)",
+    x = "Trial Count per Subject", y = "Emotion"
+  ) +
+  theme_ridges(font_size = 13, grid = TRUE) +
+  theme(legend.position = "right")
+
+# 导出ridge plots
+ggsave(file.path(out_dir, "RidgePlot_Accept_Trials_by_Emotion.png"), p_accept, width = 7.8, height = 5.1, dpi = 350)
+ggsave(file.path(out_dir, "RidgePlot_Reject_Trials_by_Emotion.png"), p_reject, width = 7.8, height = 5.1, dpi = 350)
+
+
+```
+
+---
+
+# 6. 结果汇报建议（可直接主文/补充材料引用）
+
+``` {r results-write, eval=FALSE}
+cat("
+Both trial-by-trial LPP and FRN significantly predicted the probability of rejecting unfair offers, controlling for the emotional expression of the proposer. Mixed-effect logistic regression revealed robust neural-behavioral associations, with the relationship between LPP/FRN and rejection probability further moderated by emotion type. (See Supplementary Figs. and Model_Fit_Summary.csv.)
+")
+```
+---
+
+<!-- 
+功能注释：
+1. 数据准备：只用unfair条件，并自动标准化EEG变量。
+2. 模型建构：主效应+交互（LPP/FRN × emotion），主模型与随机斜率敏感性分析。
+3. 置信区间：Profile/Bootstrap两类，供SCI报告补充材料。
+4. 可视化：每种emotion下LPP/FRN对拒绝概率的拟合曲线+置信带，自动导图。
+5. 试次分布描述：防止极端不均衡，透明数据汇报。
+6. 结果模板：方便直接汇报。
+-->
+

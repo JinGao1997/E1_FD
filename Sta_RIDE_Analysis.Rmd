@@ -1,0 +1,119 @@
+# ===============================
+#  RIDE trial-level LMM分析（s/c/r分量分别建模, 400–800ms窗口）
+# ===============================
+# 分析内容：分别分析 LPP_s_400_800, LPP_c_400_800, LPP_r_400_800
+# 固定效应：Condition, Emotion（及其交互）
+# 随机项：Subject
+# 可选扩展：添加RT协变量、其它模型
+
+# ---------- 1. 加载R包 ----------
+required_packages <- c(
+  "lme4", "lmerTest", "emmeans", "performance", "ggplot2", "DHARMa",
+  "dplyr", "tibble"
+)
+for(pkg in required_packages){
+  if(!require(pkg, character.only = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+
+# ---------- 2. 读取数据 ----------
+data_path <- "C:/EEG_R_Python_Pipeline_JG/E1_UG/RIDE_trial_level_LPP_FRN_longformat.csv"
+df <- read.csv(data_path, stringsAsFactors = FALSE)
+df$Subject <- as.factor(df$Subject)
+df$Condition <- as.factor(df$Condition)
+df$Emotion <- as.factor(df$Emotion)
+if("RealTrialID" %in% names(df)) df$RealTrialID <- as.integer(df$RealTrialID)
+
+# ---------- 3. 循环分析每个分量 ----------
+component_list <- list(
+  "LPP_s_400_800" = "LPP_s_400_800",
+  "LPP_c_400_800" = "LPP_c_400_800",
+  "LPP_r_400_800" = "LPP_r_400_800"
+)
+
+results_dir <- "C:/EEG_R_Python_Pipeline_JG/E1_UG"
+if(!dir.exists(results_dir)) dir.create(results_dir)
+
+for(comp_label in names(component_list)){
+  comp_var <- component_list[[comp_label]]
+  cat("\n正在分析分量:", comp_label, "\n")
+  
+  # 只保留无缺失的trial
+  dsub <- df[!is.na(df[[comp_var]]), ]
+  
+  # ===== 4. 定义模型 =====
+  model_list <- list()
+  model_specs <- list(
+    "main_add"  = as.formula(paste0(comp_var, " ~ Condition + Emotion + (1|Subject)")),
+    "intxn"     = as.formula(paste0(comp_var, " ~ Condition * Emotion + (1|Subject)"))
+    # 如需加入RT协变量，添加下行
+    # "intxn_RT" = as.formula(paste0(comp_var, " ~ Condition * Emotion + RT + (1|Subject)"))
+  )
+  
+  # ===== 5. 拟合模型&输出结果 =====
+  for(nm in names(model_specs)){
+    formula_cur <- model_specs[[nm]]
+    cat("模型：", nm, "\n")
+    model <- try(lmer(formula_cur, data = dsub, REML = FALSE), silent = TRUE)
+    if (inherits(model, "try-error") || isSingular(model)) {
+      cat("模型", nm, "拟合失败，跳过\n")
+      next
+    }
+    model_list[[nm]] <- model
+    outprefix <- file.path(results_dir, paste0(comp_label, "_", nm))
+    
+    # (1) 模型summary和置信区间
+    sink(paste0(outprefix, "_summary.txt"))
+    cat("Model formula: ", deparse(formula(model)), "\n")
+    cat("N obs: ", nrow(dsub), "\n")
+    cat("AIC: ", AIC(model), "; BIC: ", BIC(model), "\n")
+    print(performance::r2(model))
+    cat("\n=== Summary ===\n")
+    print(summary(model))
+    cat("\n=== Confidence intervals (Wald) ===\n")
+    print(confint(model, method = "Wald"))
+    sink()
+    
+    # (2) ANOVA表
+    write.csv(as.data.frame(anova(model)), paste0(outprefix, "_ANOVA.csv"))
+    
+    # (3) emmeans及多重对比
+    emm <- emmeans(model, ~ Condition * Emotion)
+    write.csv(as.data.frame(emm), paste0(outprefix, "_emmeans.csv"), row.names = FALSE)
+    pairs_emm <- pairs(emm, adjust = "tukey")
+    write.csv(as.data.frame(pairs_emm), paste0(outprefix, "_Pairs.csv"), row.names = FALSE)
+    
+    # (4) 可视化: 柱状图
+    emm_df <- as.data.frame(emm)
+    p <- ggplot(emm_df, aes(x=Emotion, y=emmean, fill=Condition)) +
+      geom_col(position=position_dodge(), width=0.65) +
+      geom_errorbar(aes(ymin=emmean-SE, ymax=emmean+SE), width=0.22, position=position_dodge(.65)) +
+      labs(
+        title = paste0(comp_label, " (", nm, "): Condition × Emotion"),
+        y = paste0("Mean ", comp_label, " (µV)"), x = "Emotion"
+      ) +
+      theme_bw(base_size = 14)
+    ggsave(paste0(outprefix, "_Barplot.png"), p, width=8, height=5, dpi=300)
+    
+    # (5) DHARMa残差诊断图
+    sim <- DHARMa::simulateResiduals(model)
+    png(paste0(outprefix, "_DHARMa_residuals.png"), width=800, height=600)
+    plot(sim)
+    dev.off()
+  }
+  
+  # ===== 6. 输出各模型对比表 =====
+  if(length(model_list) > 0){
+    comp_df <- tibble(
+      model = names(model_list),
+      formula = sapply(model_list, function(m) paste(deparse(formula(m)), collapse = "")),
+      R2_marginal = sapply(model_list, function(m) performance::r2(m)$R2_marginal),
+      R2_conditional = sapply(model_list, function(m) performance::r2(m)$R2_conditional),
+      AIC = sapply(model_list, AIC),
+      BIC = sapply(model_list, BIC)
+    )
+    write.csv(comp_df, file.path(results_dir, paste0(comp_label, "_LMM_model_comparison.csv")), row.names = FALSE)
+  }
+}
+
+cat("\n全部分量统计分析和模型对比已完成！\n结果输出在：", results_dir, "\n")

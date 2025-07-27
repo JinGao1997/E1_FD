@@ -1,0 +1,234 @@
+---
+title: "E1_UG_EEG"
+author: "JinGao"
+date: "05/05/2025"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+py_config()  # 检查路径
+
+# 只要这一步的python路径和你的site-packages一致，接下来直接import
+pipeline <- import("pipeline")
+
+
+```
+
+# packages
+
+Install miniconda if necessary
+
+```{r, include=FALSE, eval=FALSE}
+install.packages("reticulate")
+reticulate::install_miniconda()
+```
+
+
+more packages
+
+```{r, eval = FALSE, echo=FALSE}
+source("https://neuroconductor.org/neurocLite.R")
+# 
+# # Default Install
+#neuro_install('eegUtils')
+#install.packages("gtools")
+
+library(here)
+library(tidyverse)
+library(ggplot2)
+
+library(eegUtils)
+library(htmltools)
+
+library(vroom)
+library(gtools)
+library(dplyr)
+
+```
+
+```{r preprocess-logs, eval = FALSE,  echo=FALSE}
+# 0) 日志预处理：.txt → trial.csv & summaryPostRating.csv（自动识别 UTF-8 / UTF-16LE）
+library(here)
+library(readr)
+library(dplyr)
+library(stringr)
+
+# 找到所有 .txt 日志，创建输出目录
+orig_logs <- list.files(
+  here("data", "csv_all"),
+  pattern    = "\\.txt$",
+  full.names = TRUE
+)
+out_dir <- here("data", "csv_filtered")
+out_summary <- here("data", "csv_summaryPostRating")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_summary, showWarnings = FALSE, recursive = TRUE)
+
+for (fpath in orig_logs) {
+  # 1) 检测前两个字节：FF FE → UTF-16LE， 否则当 UTF-8
+  fb  <- file(fpath, "rb")
+  bom <- readBin(fb, "raw", n = 2)
+  close(fb)
+  encoding <- if (
+    length(bom) == 2 &&
+    identical(bom, as.raw(c(0xFF, 0xFE)))
+  ) "UTF-16LE" else "UTF-8"
+
+  # 2) 用 read_delim 读取，readr 会自动跳过 BOM
+  df <- read_delim(
+    fpath,
+    delim          = "\t",
+    col_types      = cols(),
+    show_col_types = FALSE,
+    locale         = locale(encoding = encoding)
+  )
+
+  n <- nrow(df)
+  # 3) trial 数据去掉最后三行（post rating）
+  df_trials <- df %>%
+    slice(1:(n-3)) %>%
+    filter(block != 7) %>%
+    mutate(emotion = str_extract(stim, "enj|dis|dom|neu|aff"))
+
+  # 4) summary/post rating 数据
+  df_summary <- df %>% slice((n-2):n)
+
+  # 5) 写出 CSV
+  out_name <- paste0(tools::file_path_sans_ext(basename(fpath)), ".csv")
+  out_name_summary <- paste0(tools::file_path_sans_ext(basename(fpath)), "_summaryPostRating.csv")
+  write_csv(df_trials, file.path(out_dir, out_name))
+  write_csv(df_summary, file.path(out_summary, out_name_summary))
+}
+
+```
+
+```{r face-phase, eval = FALSE,  echo=FALSE}
+# 1) Face-locked Phase
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+pipeline <- import("pipeline")
+
+res_face <- pipeline$group_pipeline(
+  raw_files     = here("data","raw_all_cropped"),
+  log_files     = here("data","csv_filtered"),
+  output_dir    = here("export","face_phase"),
+  #epochs_dir    = here("epochs","face_phase"),
+  #report_dir    = here("reports","face_phase_qc"), 
+  ica_method    = "fastica",
+  ica_n_components = 0.99,
+  #downsample_sfreq = 250,
+  triggers      = c(101:115, 201:215),
+  bad_channels  = "auto",
+  highpass_freq = 0.05,
+  lowpass_freq  = 30.0,
+  reject_peak_to_peak= 200.0,
+  components    = list(
+    name = list("P1","N170","EPN","LPP_face"),
+    tmin = list(0.080,0.130,0.200,0.400),
+    tmax = list(0.130,0.200,0.350,0.600),
+    roi  = list(
+      c("O1","O2","Oz","PO7","PO8"),
+      c("TP9","TP10","P7","P8","PO9","PO10","O1","O2"),
+      c("PO7","PO8","PO9","PO10","TP9","TP10"),
+      c("Pz","Cz","C1","C2","CP1","CP2")
+    )
+  ),
+   average_by = list(
+    Face_enj = "emotion=='enj' & reaction>0",
+    Face_dis = "emotion=='dis' & reaction>0",
+    Face_dom = "emotion=='dom' & reaction>0",
+    Face_neu = "emotion=='neu' & reaction>0",
+    Face_aff = "emotion=='aff' & reaction>0")
+)
+trials_face  <- res_face[[1]]
+evokeds_face <- res_face[[2]]
+config_face  <- res_face[[3]]
+```
+
+```{r offer-phase, eval = FALSE,  echo=FALSE}
+# 2) Offer-locked Phase
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+pipeline <- import("pipeline")
+
+res_offer <- pipeline$group_pipeline(
+  raw_files     = here("data","raw_all_cropped"),
+  log_files     = here("data","csv_filtered"),
+  output_dir    = here("export","offer_phase"),
+  #epochs_dir    = here("epochs","offer_phase"),
+  #report_dir    = here("reports","offer_phase_qc"),
+  ica_method    = "fastica",
+  ica_n_components = 0.99,
+  #downsample_sfreq = 250,
+  triggers      = c(10:89, 150:169),
+  bad_channels  = "auto",
+  highpass_freq = 0.05,
+  lowpass_freq  = 30.0,
+  reject_peak_to_peak= 200.0,
+  components    = list(
+    name = list("FRN","LPP_offer"),
+    tmin = list(0.250,0.400),
+    tmax = list(0.300,0.800),
+    roi  = list(
+      c("F3","Fz","F4","FC1","FC2","Cz"),
+      c("Pz","Cz","C1","C2","CP1","CP2")
+    )
+  ),
+  
+  average_by = list(
+    # 5:5
+    Face_enj_5_5 = "emotion=='enj' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_5_5 = "emotion=='dis' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_5_5 = "emotion=='dom' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_5_5 = "emotion=='neu' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_5_5 = "emotion=='aff' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    # 6:4
+    Face_enj_6_4 = "emotion=='enj' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_6_4 = "emotion=='dis' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_6_4 = "emotion=='dom' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_6_4 = "emotion=='neu' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_6_4 = "emotion=='aff' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    # 7:3
+    Face_enj_7_3 = "emotion=='enj' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_7_3 = "emotion=='dis' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_7_3 = "emotion=='dom' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_7_3 = "emotion=='neu' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_7_3 = "emotion=='aff' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    # 8:2
+    Face_enj_8_2 = "emotion=='enj' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_8_2 = "emotion=='dis' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_8_2 = "emotion=='dom' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_8_2 = "emotion=='neu' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_8_2 = "emotion=='aff' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    
+    # 9:1
+    Face_enj_9_1 = "emotion=='enj' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_9_1 = "emotion=='dis' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_9_1 = "emotion=='dom' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_9_1 = "emotion=='neu' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_9_1 = "emotion=='aff' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000"
+  )
+)
+
+trials_offer  <- res_offer[[1]]
+evokeds_offer <- res_offer[[2]]
+config_offer  <- res_offer[[3]]
+```
+
+
+
+
+
+
+
+
+
+
+

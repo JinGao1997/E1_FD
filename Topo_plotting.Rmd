@@ -1,0 +1,350 @@
+---
+title: "Decision_plotting"
+output: html_document
+date: "2025-07-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r face phaseTopo}
+# ========== Face Phase Topoplot Script (Optimized Final Version) ==========
+# 高标准·高可复用·所有diff地形图色阶一致
+# - P1/N170/EPN/LPP
+# - 每成分“raw/diff”地形图色阶一致（diff色阶自动算一次后全程调用）
+# - 自动创建目录，输出进度，推荐ggsave为.tiff（高分辨率）
+# - 标注每个阶段的作用
+# face_phase_topo_final_manualRaw.R
+# ------------------------------------------------
+# Face Phase ERP Topographies: 手动指定raw limits
+#   - raw: 手动limits (每成分独立)
+#   - diff: 自动最大绝对值
+# ------------------------------------------------
+
+library(tidyverse)
+library(eegUtils)
+
+if ("package:plyr" %in% loadedNamespaces()) detach("package:plyr", unload=TRUE)
+
+# 1. 目录
+face_dir <- "E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/offerphase400800/face_phase"
+plot_dir <- file.path(face_dir, "plots")
+raw_dir  <- file.path(plot_dir, "raw")
+diff_dir <- file.path(plot_dir, "diff")
+dir.create(raw_dir,  recursive=TRUE, showWarnings=FALSE)
+dir.create(diff_dir, recursive=TRUE, showWarnings=FALSE)
+
+# 2. 读取数据
+grand <- read_csv(file.path(face_dir, "grand_ave_GROUPLEVEL.csv"), show_col_types=FALSE)
+chanlocs <- read_csv(file.path(face_dir, "channel_locations.csv"), show_col_types=FALSE) %>%
+  rename(electrode = channel)
+eeg_cols <- intersect(chanlocs$electrode, names(grand))
+
+# 3. ERP设置
+face_comp <- list(
+  P1   = list(win=c(0.08,0.13),  roi=c("O1","O2","Oz","PO7","PO8"),                      label="80–130 ms"),
+  N170 = list(win=c(0.13,0.20),  roi=c("TP9","TP10","P7","P8","PO9","PO10","O1","O2"),    label="130–200 ms"),
+  EPN  = list(win=c(0.20,0.35),  roi=c("PO7","PO8","PO9","PO10","TP9","TP10"),            label="200–350 ms"),
+  LPP  = list(win=c(0.40,0.60),  roi=c("Pz","Cz","C1","C2","CP1","CP2"),                  label="400–600 ms")
+)
+emotions <- c("neu","aff","dis","dom","enj")
+
+# 4. limits（手动指定raw，diff自动）
+limits_raw <- list(
+  P1   = c(-1.5,3),      # 你可以根据自己需要调整
+  N170 = c(-2,2.7),      # 你可以根据自己需要调整
+  EPN  = c(-1.8,6.3),      # 你可以根据自己需要调整
+  LPP  = c(-2,3)       # 你可以根据自己需要调整
+)
+
+# diff limits自动
+compute_limits_diff <- function(comp){
+  cfg   <- face_comp[[comp]]
+  mats  <- lapply(emotions, function(emo){
+    grand %>%
+      filter(emotion==emo, time>=cfg$win[1], time<=cfg$win[2]) %>%
+      summarise(across(all_of(eeg_cols), ~ mean(.x, na.rm=TRUE)))
+  })
+  M_df  <- bind_rows(mats)
+  M_mat <- as.matrix(M_df)
+  neu_vec <- M_mat[1, ]
+  D <- sweep(M_mat[-1, , drop=FALSE], 2, neu_vec, FUN = "-")
+  m <- max(abs(D), na.rm=TRUE)
+  c(-m, m)
+}
+limits_diff <- map(names(face_comp), compute_limits_diff) %>% set_names(names(face_comp))
+
+# 5. 改进后的绘图函数
+plot_topo <- function(dat_long, roi, comp, subtitle, caption, fname, lims, contour=TRUE){
+  p <- topoplot(
+        dat_long,
+        chan_locs    = chanlocs,
+        interp_limit = "head",
+        contour      = contour,    # <- 关键设置
+        points       = TRUE,
+        highlights   = roi,
+        palette      = "RdBu",
+        limits       = lims
+      ) +
+      labs(title    = comp,
+           subtitle = subtitle,
+           caption  = caption) +
+      theme(plot.title    = element_text(size=18,face="bold"),
+            plot.subtitle = element_text(size=14),
+            plot.caption  = element_text(size=12, color="grey40"))
+  ggsave(fname, plot=p, device="tiff", width=6, height=6, dpi=300)
+}
+
+# 6. 原始地形图（raw）→ raw_dir
+for(comp in names(face_comp)){
+  cfg  <- face_comp[[comp]]
+  lims <- limits_raw[[comp]]
+  for(emo in emotions){
+    dat <- grand %>%
+      filter(emotion==emo, time>=cfg$win[1], time<=cfg$win[2]) %>%
+      summarise(across(all_of(eeg_cols), ~ mean(.x, na.rm=TRUE))) %>%
+      pivot_longer(cols      = all_of(eeg_cols),
+                   names_to  = "electrode",
+                   values_to = "amplitude")
+    fname <- file.path(raw_dir, sprintf("%s_%s.tiff", comp, emo))
+    plot_topo(dat, cfg$roi, comp, emo, cfg$label, fname, lims, contour=TRUE) # 保持原样
+  }
+}
+
+# 7. 差异地形图（diff）→ diff_dir
+for(comp in names(face_comp)){
+  cfg  <- face_comp[[comp]]
+  lims <- limits_diff[[comp]]
+  for(emo in setdiff(emotions, "neu")){
+    emo_vec <- grand %>%
+      filter(emotion==emo, time>=cfg$win[1], time<=cfg$win[2]) %>%
+      summarise(across(all_of(eeg_cols), ~ mean(.x, na.rm=TRUE)))
+    neu_vec <- grand %>%
+      filter(emotion=="neu", time>=cfg$win[1], time<=cfg$win[2]) %>%
+      summarise(across(all_of(eeg_cols), ~ mean(.x, na.rm=TRUE)))
+    diff_vals <- as.numeric(emo_vec) - as.numeric(neu_vec)
+    diff_dat  <- tibble(electrode = eeg_cols, amplitude = diff_vals)
+    fname     <- file.path(diff_dir, sprintf("%s_diff_%s.tiff", comp, emo))
+    plot_topo(diff_dat, cfg$roi, comp, paste0(emo, " – neu"), cfg$label, fname, lims, contour=FALSE)  # 关键：不显示等高线
+  }
+}
+
+
+message("✅ Face‐phase topoplots (手动raw limits) saved:\n  raw → ", raw_dir, "\n  diff → ", diff_dir)
+
+```
+
+```{r offer phaseTopo}
+# decision_topo_final.R（最终定制版）
+# ------------------------------------------------
+# ERP Topographies: raw, condition‐diff, main & diff effects
+# 色阶范围完全按你的要求：
+# - FRN原始地形图 limits = c(-1.5, 3)  
+# - LPP原始地形图 limits = c(-2.5, 3.5) 
+# - 差异地形图（FRN/LPP）limits = 自动（各自最大绝对值）
+# - raw与主效应 contour=TRUE，所有diff contour=FALSE
+# ------------------------------------------------
+
+library(tidyverse)
+library(eegUtils)
+
+if ("package:plyr" %in% loadedNamespaces()) detach("package:plyr", unload=TRUE)
+
+# 1. Directories
+data_dir       <- "E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/offerphase400800/offer_phase"
+plot_dir       <- file.path(data_dir, "plots")
+raw_dir        <- file.path(plot_dir, "raw")
+diff_dir       <- file.path(plot_dir, "diff")
+emo_main_dir   <- file.path(plot_dir, "emotion_main")
+emo_diff_dir   <- file.path(plot_dir, "emotion_diff")
+offer_main_dir <- file.path(plot_dir, "offer_main")
+offer_diff_dir <- file.path(plot_dir, "offer_diff")
+
+dir.create(raw_dir,        recursive=TRUE, showWarnings=FALSE)
+dir.create(diff_dir,       recursive=TRUE, showWarnings=FALSE)
+dir.create(emo_main_dir,   recursive=TRUE, showWarnings=FALSE)
+dir.create(emo_diff_dir,   recursive=TRUE, showWarnings=FALSE)
+dir.create(offer_main_dir, recursive=TRUE, showWarnings=FALSE)
+dir.create(offer_diff_dir, recursive=TRUE, showWarnings=FALSE)
+
+# 2. Read data (suppress column specs)
+grand   <- read_csv(file.path(data_dir, "grand_ave_GROUPLEVEL.csv"), show_col_types=FALSE)
+chanlocs <- read_csv(file.path(data_dir, "channel_locations.csv"), show_col_types=FALSE)
+names(chanlocs)[names(chanlocs)=="channel"] <- "electrode"
+
+# 3. Parameters
+eeg_cols     <- c(
+  "Fp1","Fpz","Fp2","AF7","AF3","AFz","AF4","AF8",
+  "F9","F7","F5","F3","Fz","F4","F6","F8","F10","FT7",
+  "FC5","FC3","FC1","FC2","FC4","FC6","FT8","T7","C5","C3",
+  "C1","Cz","C2","C4","C6","T8","TP9","TP7","CP5","CP3",
+  "CP1","CPz","CP2","CP4","CP6","TP8","TP10","P7","P5","P3",
+  "Pz","P4","P6","P8","PO9","PO7","PO3","POz","PO4","PO8",
+  "PO10","O1","Oz","O2"
+)
+frn_win      <- c(0.250, 0.300);    roi_frn <- c("F3","Fz","F4","FC1","FC2","Cz")
+lpp_win      <- c(0.400, 0.800);    roi_lpp <- c("Pz","Cz","C1","C2","CP1","CP2")
+emotion_list <- c("aff","dis","dom","enj")
+offer_types  <- c("fair","unfair")
+time_labels  <- list(FRN="250–300", LPP="400–800")
+
+# 4. 色阶范围设置
+compute_global_limits <- function(win) {
+  amps <- map_df(offer_types, function(ofr) {
+    map_df(c("neu", emotion_list), function(emo) {
+      grand %>%
+        filter(emotion==emo, offer_type==ofr, time>=win[1], time<=win[2]) %>%
+        summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE)) %>%
+        pivot_longer(everything(), names_to="el", values_to="amp")
+    })
+  })
+  m <- max(abs(amps$amp), na.rm=TRUE); c(-m, m)
+}
+compute_diff_limits <- function(win) {
+  diffs <- map_df(offer_types, function(ofr) {
+    map_df(emotion_list, function(emo) {
+      m1 <- grand %>%
+        filter(emotion==emo, offer_type==ofr, time>=win[1], time<=win[2]) %>%
+        summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+      m0 <- grand %>%
+        filter(emotion=="neu", offer_type==ofr, time>=win[1], time<=win[2]) %>%
+        summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+      (m1 - m0) %>% pivot_longer(everything(), names_to="el", values_to="amp")
+    })
+  })
+  m <- max(abs(diffs$amp), na.rm=TRUE); c(-m, m)
+}
+limits_raw  <- list(FRN=compute_global_limits(frn_win), LPP=compute_global_limits(lpp_win))
+limits_diff <- list(FRN=compute_diff_limits(frn_win),   LPP=compute_diff_limits(lpp_win))
+limits_raw$FRN <- c(-1.5, 3)    # FRN原始图色阶
+limits_raw$LPP <- c(-2.5, 3.5)  # LPP原始图色阶
+
+# 5. 绘图函数，contour 参数控制等高线
+plot_topo <- function(dat_long, chans, roi, comp, subtitle, caption, fname, lims, contour=TRUE) {
+  p <- topoplot(dat_long,
+                chan_locs    = chans,
+                interp_limit = "head",
+                contour      = contour,
+                points       = TRUE,
+                highlights   = roi,
+                palette      = "RdBu",
+                limits       = lims) +
+       labs(title=comp, subtitle=subtitle, caption=caption) +
+       theme(plot.title=element_text(size=18,face="bold"),
+             plot.subtitle=element_text(size=14),
+             plot.caption=element_text(size=12, color="grey40"))
+  ggsave(fname, plot=p, device="tiff", width=6, height=6, dpi=300)
+}
+
+# 6. Raw topographies → raw_dir（contour=TRUE）
+for (comp in c("FRN","LPP")) {
+  win    <- if(comp=="FRN") frn_win else lpp_win
+  roi    <- if(comp=="FRN") roi_frn else roi_lpp
+  lims   <- limits_raw[[comp]]
+  tlabel <- time_labels[[comp]]
+  for (ofr in offer_types) for (emo in c("neu", emotion_list)) {
+    dat_avg   <- grand %>%
+      filter(emotion==emo, offer_type==ofr, time>=win[1], time<=win[2]) %>%
+      summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE)) %>%
+      pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+    subtitle  <- paste(ofr, emo, sep=" | ")
+    caption   <- paste0(tlabel, " ms [limits: ", paste(lims, collapse=", "), "]")
+    fname     <- file.path(raw_dir, sprintf("%s_%s_%s.tiff", comp, ofr, emo))
+    plot_topo(dat_avg, chanlocs, roi, comp, subtitle, caption, fname, lims, contour=TRUE)
+  }
+}
+
+# 7. Conditional diffs → diff_dir（contour=FALSE）
+for (comp in c("FRN","LPP")) {
+  win    <- if(comp=="FRN") frn_win else lpp_win
+  roi    <- if(comp=="FRN") roi_frn else roi_lpp
+  lims   <- limits_diff[[comp]]
+  tlabel <- time_labels[[comp]]
+  for (ofr in offer_types) for (emo in emotion_list) {
+    m1       <- grand %>% filter(emotion==emo,    offer_type==ofr, time>=win[1], time<=win[2]) %>%
+                  summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+    m0       <- grand %>% filter(emotion=="neu",  offer_type==ofr, time>=win[1], time<=win[2]) %>%
+                  summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+    diff_dat <- (m1 - m0) %>% pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+    subtitle <- paste(ofr, paste0(emo," – neu"), sep=" | ")
+    caption  <- paste0(tlabel, " ms [limits: ", paste(lims, collapse=", "), "]")
+    fname    <- file.path(diff_dir, sprintf("%s_diff_%s_%s.tiff", comp, ofr, emo))
+    plot_topo(diff_dat, chanlocs, roi, comp, subtitle, caption, fname, lims, contour=FALSE)
+  }
+}
+
+# 8. Emotion main effects → emo_main_dir（contour=TRUE）
+for (comp in c("FRN","LPP")) {
+  win    <- if(comp=="FRN") frn_win else lpp_win
+  roi    <- if(comp=="FRN") roi_frn else roi_lpp
+  lims   <- limits_raw[[comp]]
+  tlabel <- time_labels[[comp]]
+  for (emo in c("neu", emotion_list)) {
+    dat_avg   <- grand %>% filter(emotion==emo, time>=win[1], time<=win[2]) %>%
+                  summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE)) %>%
+                  pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+    subtitle  <- paste0(emo, " (avgOffers)")
+    caption   <- paste0(tlabel, " ms [limits: ", paste(lims, collapse=", "), "]")
+    fname     <- file.path(emo_main_dir, sprintf("%s_%s_avgOffers.tiff", comp, emo))
+    plot_topo(dat_avg, chanlocs, roi, comp, subtitle, caption, fname, lims, contour=TRUE)
+  }
+}
+
+# 9. Emotion diffs main → emo_diff_dir（contour=FALSE）
+for (comp in c("FRN","LPP")) {
+  win    <- if(comp=="FRN") frn_win else lpp_win
+  roi    <- if(comp=="FRN") roi_frn else roi_lpp
+  lims   <- limits_diff[[comp]]
+  tlabel <- time_labels[[comp]]
+  for (emo in emotion_list) {
+    m_emo    <- grand %>% filter(emotion==emo, time>=win[1], time<=win[2]) %>%
+                  summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+    m_neu    <- grand %>% filter(emotion=="neu", time>=win[1], time<=win[2]) %>%
+                  summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+    diff_dat <- (m_emo - m_neu) %>% pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+    subtitle <- paste0(emo, " – neu (avgOffers)")
+    caption  <- paste0(tlabel, " ms [limits: ", paste(lims, collapse=", "), "]")
+    fname    <- file.path(emo_diff_dir, sprintf("%s_diff_%s_avgOffers.tiff", comp, emo))
+    plot_topo(diff_dat, chanlocs, roi, comp, subtitle, caption, fname, lims, contour=FALSE)
+  }
+}
+
+# 10. Offer main effects → offer_main_dir（contour=TRUE）
+for (comp in c("FRN","LPP")) {
+  win    <- if(comp=="FRN") frn_win else lpp_win
+  roi    <- if(comp=="FRN") roi_frn else roi_lpp
+  lims   <- limits_raw[[comp]]
+  tlabel <- time_labels[[comp]]
+  for (ofr in offer_types) {
+    dat_avg   <- grand %>% filter(offer_type==ofr, time>=win[1], time<=win[2]) %>%
+                  summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE)) %>%
+                  pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+    subtitle  <- paste0(ofr, " (avgEmotions)")
+    caption   <- paste0(tlabel, " ms [limits: ", paste(lims, collapse=", "), "]")
+    fname     <- file.path(offer_main_dir, sprintf("%s_offer_%s_avgEmotions.tiff", comp, ofr))
+    plot_topo(dat_avg, chanlocs, roi, comp, subtitle, caption, fname, lims, contour=TRUE)
+  }
+}
+
+# 11. Offer diffs main → offer_diff_dir（contour=FALSE）
+for (comp in c("FRN","LPP")) {
+  win    <- if(comp=="FRN") frn_win else lpp_win
+  roi    <- if(comp=="FRN") roi_frn else roi_lpp
+  lims   <- limits_diff[[comp]]
+  tlabel <- time_labels[[comp]]
+  m_unfair <- grand %>% filter(offer_type=="unfair", time>=win[1], time<=win[2]) %>%
+                summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+  m_fair   <- grand %>% filter(offer_type=="fair",   time>=win[1], time<=win[2]) %>%
+                summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+  diff_dat <- (m_unfair - m_fair) %>% pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+  subtitle <- "unfair – fair (avgEmotions)"
+  caption  <- paste0(tlabel, " ms [limits: ", paste(lims, collapse=", "), "]")
+  fname    <- file.path(offer_diff_dir, sprintf("%s_diff_unfair_fair_avgEmotions.tiff", comp))
+  plot_topo(diff_dat, chanlocs, roi, comp, subtitle, caption, fname, lims, contour=FALSE)
+}
+
+message("✅ All topoplots saved and archived under: ", plot_dir)
+
+```
+
