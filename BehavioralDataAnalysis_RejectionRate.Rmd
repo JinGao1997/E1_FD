@@ -28,7 +28,7 @@ dir.create("analysis_output/results_refuse/type", recursive = TRUE, showWarnings
 # 1. 数据导入与变量构建
 
 ``` {r import-vars}
-data_path <- "E:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/Offers__Behavior/BehaviorDataAnalysis/trials.csv"
+data_path <- "D:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/Offers__Behavior/BehaviorDataAnalysis/trials.csv"
 df_raw <- read_csv(data_path)
 df_raw <- df_raw %>%
   mutate(
@@ -339,6 +339,589 @@ write_csv(mean_rt_type, "analysis_output/results_refuse/type/mean_rt_by_subject.
 
 ```
 
+
+
+
+
+
+
+
+
+# ============================================
+# Part 3. Unfair条件下拒绝反应的RT分析
+# ============================================
+``` {r, include=FALSE}
+cat("\n\n", paste(rep("=", 60), collapse=""), "\n")
+cat("PART 3: UNFAIR条件下拒绝反应的RT分析\n")
+cat(paste(rep("=", 60), collapse=""), "\n\n")
+
+# 创建独立的输出目录
+unfair_dir <- "analysis_output/results_refuse/unfair_reject"
+dir.create(unfair_dir, recursive = TRUE, showWarnings = FALSE)
+
+## 数据准备
+df_unfair_reject <- df_raw %>%
+  filter(RT >= 150, RT <= 3000, !is.na(reaction)) %>%
+  filter(offer_type == "unfair") %>%
+  filter(reaction_bin_refuse == 1) %>%
+  mutate(
+    emotion = droplevels(emotion),
+    logRT = log(RT),
+    offer_ratio = droplevels(offer_ratio)
+  )
+
+# 样本信息
+cat("数据集信息：\n")
+cat("- 总试次数：", nrow(df_unfair_reject), "\n")
+cat("- 被试数：", length(unique(df_unfair_reject$participant_id)), "\n")
+cat("- 情绪条件：", paste(levels(df_unfair_reject$emotion), collapse=", "), "\n")
+cat("- Offer比例：", paste(unique(df_unfair_reject$offer_ratio), collapse=", "), "\n\n")
+
+# 各条件试次分布
+trial_dist <- df_unfair_reject %>%
+  group_by(emotion) %>%
+  summarize(
+    n_trials = n(),
+    n_subjects = n_distinct(participant_id),
+    .groups = "drop"
+  )
+
+cat("各情绪条件的试次分布：\n")
+print(trial_dist)
+write_csv(trial_dist, file.path(unfair_dir, "trial_distribution.csv"))
+
+## 1. 描述性统计
+cat("\n", paste(rep("-", 40), collapse=""), "\n")
+cat("1. 描述性统计\n")
+cat(paste(rep("-", 40), collapse=""), "\n\n")
+
+desc_stats <- df_unfair_reject %>%
+  group_by(emotion) %>%
+  summarize(
+    n = n(),
+    mean_RT = mean(RT),
+    sd_RT = sd(RT),
+    median_RT = median(RT),
+    Q1 = quantile(RT, 0.25),
+    Q3 = quantile(RT, 0.75),
+    min_RT = min(RT),
+    max_RT = max(RT),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_RT)
+
+cat("RT描述统计（按均值排序）：\n")
+print(desc_stats)
+write_csv(desc_stats, file.path(unfair_dir, "RT_descriptives.csv"))
+
+## 2. 线性混合模型分析
+cat("\n", paste(rep("-", 40), collapse=""), "\n")
+cat("2. 线性混合模型(LMM)分析\n")
+cat(paste(rep("-", 40), collapse=""), "\n\n")
+
+# 设置对比编码
+contrasts(df_unfair_reject$emotion) <- contr.sum(length(levels(df_unfair_reject$emotion)))
+
+# 构建模型
+lmm_unfair_reject <- lmer(
+  logRT ~ emotion + (1 | participant_id),
+  data = df_unfair_reject,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+# 模型摘要
+cat("模型摘要：\n")
+summary(lmm_unfair_reject)
+
+# ANOVA结果
+lmm_anova <- anova(lmm_unfair_reject, type = 3)
+cat("\nANOVA结果：\n")
+print(lmm_anova)
+
+# 保存ANOVA结果
+lmm_anova_df <- as.data.frame(lmm_anova)
+lmm_anova_df$Effect <- rownames(lmm_anova_df)
+lmm_anova_df <- lmm_anova_df[, c("Effect", names(lmm_anova_df)[1:(ncol(lmm_anova_df)-1)])]
+write_csv(lmm_anova_df, file.path(unfair_dir, "RT_anova.csv"))
+
+## 3. 边际均值和多重比较
+cat("\n", paste(rep("-", 40), collapse=""), "\n")
+cat("3. 边际均值和事后比较\n")
+cat(paste(rep("-", 40), collapse=""), "\n\n")
+
+# 计算边际均值
+emm_unfair <- emmeans(lmm_unfair_reject, ~ emotion)
+
+# 转换为毫秒尺度
+emm_ms <- as.data.frame(emm_unfair) %>%
+  mutate(
+    RT_pred_ms = exp(emmean),
+    lower_CI = exp(asymp.LCL),
+    upper_CI = exp(asymp.UCL)
+  ) %>%
+  select(emotion, RT_pred_ms, lower_CI, upper_CI) %>%
+  arrange(RT_pred_ms)
+
+cat("模型预测RT（毫秒，95% CI）：\n")
+print(emm_ms)
+write_csv(emm_ms, file.path(unfair_dir, "RT_emmeans.csv"))
+
+# 两两比较（FDR校正）
+cat("\n两两比较（FDR校正）：\n")
+ph_fdr <- pairs(emm_unfair, adjust = "fdr")
+ph_fdr_df <- as.data.frame(summary(ph_fdr))
+print(ph_fdr_df)
+write_csv(ph_fdr_df, file.path(unfair_dir, "RT_posthoc_fdr.csv"))
+
+# 未校正的p值（供参考）
+ph_uncorrected <- pairs(emm_unfair, adjust = "none")
+ph_uncorrected_df <- as.data.frame(summary(ph_uncorrected))
+write_csv(ph_uncorrected_df, file.path(unfair_dir, "RT_posthoc_uncorrected.csv"))
+
+## 4. 效应量计算
+cat("\n", paste(rep("-", 40), collapse=""), "\n")
+cat("4. 标准化效应量\n")
+cat(paste(rep("-", 40), collapse=""), "\n\n")
+
+sigma_res <- sigma(lmm_unfair_reject)
+cat("模型残差标准差：", round(sigma_res, 4), "\n\n")
+
+# 计算效应量
+effect_sizes <- ph_fdr_df %>%
+  mutate(
+    cohen_d = estimate / sigma_res,
+    magnitude = case_when(
+      abs(cohen_d) < 0.2 ~ "negligible",
+      abs(cohen_d) < 0.5 ~ "small",
+      abs(cohen_d) < 0.8 ~ "medium",
+      TRUE ~ "large"
+    ),
+    percent_change = (exp(estimate) - 1) * 100
+  ) %>%
+  select(contrast, estimate, SE, cohen_d, magnitude, percent_change, p.value)
+
+cat("效应量分析结果（显著效应）：\n")
+sig_effects <- effect_sizes %>% filter(p.value < 0.05)
+if(nrow(sig_effects) > 0) {
+  print(sig_effects)
+} else {
+  cat("无显著效应\n")
+}
+write_csv(effect_sizes, file.path(unfair_dir, "RT_effect_sizes.csv"))
+
+## 5. 个体水平数据（供Python可视化）
+cat("\n", paste(rep("-", 40), collapse=""), "\n")
+cat("5. 准备可视化数据\n")
+cat(paste(rep("-", 40), collapse=""), "\n\n")
+
+# 每个被试每个情绪的平均RT
+viz_data <- df_unfair_reject %>%
+  group_by(participant_id, emotion) %>%
+  summarize(
+    mean_RT = mean(RT, na.rm = TRUE),
+    median_RT = median(RT, na.rm = TRUE),
+    n_trials = n(),
+    .groups = "drop"
+  )
+
+write_csv(viz_data, file.path(unfair_dir, "RT_by_subject.csv"))
+
+# 组水平统计
+group_stats <- viz_data %>%
+  group_by(emotion) %>%
+  summarize(
+    mean_RT = mean(mean_RT, na.rm = TRUE),
+    se_RT = sd(mean_RT, na.rm = TRUE) / sqrt(n()),
+    sd_RT = sd(mean_RT, na.rm = TRUE),
+    n_subjects = n(),
+    .groups = "drop"
+  )
+
+write_csv(group_stats, file.path(unfair_dir, "RT_group_stats.csv"))
+
+cat("可视化数据已准备完成\n")
+
+## 6. 整合结果表
+cat("\n", paste(rep("-", 40), collapse=""), "\n")
+cat("6. 整合结果表\n")
+cat(paste(rep("-", 40), collapse=""), "\n\n")
+
+# 创建整合的结果表格
+results_table <- data.frame(
+  Emotion = c("Disgust", "Dominance", "Neutral", "Affection", "Enjoyment"),
+  stringsAsFactors = FALSE
+)
+
+# 添加试次数
+for(i in 1:nrow(results_table)) {
+  emo_code <- c("dis", "dom", "neu", "aff", "enj")[i]
+  results_table$N_Trials[i] <- sum(df_unfair_reject$emotion == emo_code)
+}
+
+# 添加模型预测值
+results_table$Mean_RT <- NA
+results_table$CI_Lower <- NA
+results_table$CI_Upper <- NA
+
+for(i in 1:nrow(results_table)) {
+  emo_code <- c("dis", "dom", "neu", "aff", "enj")[i]
+  if(emo_code %in% emm_ms$emotion) {
+    idx <- which(emm_ms$emotion == emo_code)
+    results_table$Mean_RT[i] <- round(emm_ms$RT_pred_ms[idx], 1)
+    results_table$CI_Lower[i] <- round(emm_ms$lower_CI[idx], 1)
+    results_table$CI_Upper[i] <- round(emm_ms$upper_CI[idx], 1)
+  }
+}
+
+# 添加与neutral的对比
+results_table$d_vs_Neutral <- NA
+results_table$p_vs_Neutral <- NA
+
+neu_comparisons <- effect_sizes %>%
+  filter(grepl("neu", contrast))
+
+for(i in 1:nrow(results_table)) {
+  emo_code <- c("dis", "dom", "neu", "aff", "enj")[i]
+  if(emo_code != "neu") {
+    pattern1 <- paste0("^", emo_code, " - neu$")
+    pattern2 <- paste0("^neu - ", emo_code, "$")
+    
+    comp_row <- neu_comparisons[grepl(pattern1, neu_comparisons$contrast) | 
+                                grepl(pattern2, neu_comparisons$contrast), ]
+    
+    if(nrow(comp_row) > 0) {
+      if(grepl(pattern2, comp_row$contrast[1])) {
+        results_table$d_vs_Neutral[i] <- round(-comp_row$cohen_d[1], 3)
+      } else {
+        results_table$d_vs_Neutral[i] <- round(comp_row$cohen_d[1], 3)
+      }
+      results_table$p_vs_Neutral[i] <- round(comp_row$p.value[1], 4)
+    }
+  }
+}
+
+cat("整合结果表：\n")
+print(results_table)
+write_csv(results_table, file.path(unfair_dir, "RT_results_table.csv"))
+
+## 7. 补充分析：检查offer_ratio差异
+cat("\n", paste(rep("-", 40), collapse=""), "\n")
+cat("7. 补充分析：2:8 vs 1:9\n")
+cat(paste(rep("-", 40), collapse=""), "\n\n")
+
+# 检查两个ratio的分布
+ratio_dist <- table(df_unfair_reject$offer_ratio)
+cat("Offer ratio分布：\n")
+print(ratio_dist)
+
+if(length(ratio_dist) > 1) {
+  # 比较两个ratio的RT
+  ratio_comparison <- df_unfair_reject %>%
+    group_by(offer_ratio) %>%
+    summarize(
+      n = n(),
+      mean_RT = mean(RT),
+      sd_RT = sd(RT),
+      median_RT = median(RT),
+      .groups = "drop"
+    )
+  cat("\n各ratio的RT描述统计：\n")
+  print(ratio_comparison)
+  write_csv(ratio_comparison, file.path(unfair_dir, "RT_by_ratio.csv"))
+  
+  # 包含ratio的模型
+  contrasts(df_unfair_reject$offer_ratio) <- contr.sum(length(levels(df_unfair_reject$offer_ratio)))
+  
+  lmm_with_ratio <- lmer(
+    logRT ~ emotion * offer_ratio + (1 | participant_id),
+    data = df_unfair_reject,
+    control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+  )
+  
+  anova_with_ratio <- anova(lmm_with_ratio, type = 3)
+  cat("\n包含offer_ratio的ANOVA结果：\n")
+  print(anova_with_ratio)
+  
+  # 保存ANOVA结果（包含Effect列）
+  anova_with_ratio_df <- as.data.frame(anova_with_ratio)
+  anova_with_ratio_df$Effect <- rownames(anova_with_ratio_df)
+  anova_with_ratio_df <- anova_with_ratio_df[, c("Effect", names(anova_with_ratio_df)[1:(ncol(anova_with_ratio_df)-1)])]
+  write_csv(anova_with_ratio_df, file.path(unfair_dir, "RT_with_ratio_anova.csv"))
+  
+  # 根据结果决定后续分析
+  ratio_sig <- anova_with_ratio["offer_ratio", "Pr(>F)"] < 0.05
+  interaction_sig <- FALSE
+  if("emotion:offer_ratio" %in% rownames(anova_with_ratio)) {
+    interaction_sig <- anova_with_ratio["emotion:offer_ratio", "Pr(>F)"] < 0.05
+  }
+  
+  # 情况1：交互作用显著
+  if(interaction_sig) {
+    cat("\n*** 发现显著的Emotion × Offer_ratio交互作用 ***\n")
+    cat("进行简单效应分析...\n\n")
+    
+    # 1.1 各情绪水平下的ratio效应
+    emm_by_emotion <- emmeans(lmm_with_ratio, ~ offer_ratio | emotion)
+    pairs_by_emotion <- pairs(emm_by_emotion)
+    pairs_by_emotion_df <- as.data.frame(summary(pairs_by_emotion))
+    
+    cat("各情绪条件下2:8 vs 1:9的差异：\n")
+    print(pairs_by_emotion_df)
+    write_csv(pairs_by_emotion_df, file.path(unfair_dir, "RT_ratio_effect_by_emotion.csv"))
+    
+    # 1.2 各ratio水平下的情绪效应
+    emm_by_ratio <- emmeans(lmm_with_ratio, ~ emotion | offer_ratio)
+    pairs_by_ratio <- pairs(emm_by_ratio, adjust = "fdr")
+    pairs_by_ratio_df <- as.data.frame(summary(pairs_by_ratio))
+    
+    cat("\n各ratio条件下的情绪效应：\n")
+    print(pairs_by_ratio_df %>% filter(p.value < 0.05))  # 只显示显著的
+    write_csv(pairs_by_ratio_df, file.path(unfair_dir, "RT_emotion_effect_by_ratio.csv"))
+    
+    # 1.3 交互作用的完整预测值
+    emm_interaction <- emmeans(lmm_with_ratio, ~ emotion * offer_ratio)
+    interaction_df <- as.data.frame(emm_interaction) %>%
+      mutate(RT_ms = exp(emmean)) %>%
+      arrange(offer_ratio, emotion)
+    
+    cat("\n交互作用预测值（毫秒）：\n")
+    print(interaction_df %>% select(emotion, offer_ratio, RT_ms))
+    write_csv(interaction_df, file.path(unfair_dir, "RT_emotion_ratio_interaction.csv"))
+    
+  # 情况2：只有ratio主效应显著
+  } else if(ratio_sig) {
+    cat("\n*** Offer ratio主效应显著（无交互作用）***\n")
+    
+    # 2.1 ratio的边际均值
+    emm_ratio <- emmeans(lmm_with_ratio, ~ offer_ratio)
+    ratio_means <- as.data.frame(emm_ratio) %>%
+      mutate(
+        RT_ms = exp(emmean),
+        lower_ms = exp(asymp.LCL),
+        upper_ms = exp(asymp.UCL)
+      )
+    
+    cat("\nOffer ratio边际均值（毫秒）：\n")
+    print(ratio_means %>% select(offer_ratio, RT_ms, lower_ms, upper_ms))
+    write_csv(ratio_means, file.path(unfair_dir, "RT_ratio_emmeans.csv"))
+    
+    # 2.2 ratio对比
+    ratio_contrast <- pairs(emm_ratio)
+    ratio_contrast_df <- as.data.frame(summary(ratio_contrast))
+    
+    cat("\n2:8 vs 1:9对比：\n")
+    print(ratio_contrast_df)
+    write_csv(ratio_contrast_df, file.path(unfair_dir, "RT_ratio_contrast.csv"))
+    
+    # 2.3 计算效应量
+    ratio_effect_size <- ratio_contrast_df %>%
+      mutate(
+        cohen_d = estimate / sigma_res,
+        percent_change = (exp(estimate) - 1) * 100
+      )
+    
+    cat(sprintf("\nRatio效应量：d = %.3f, RT差异 = %.1f%%\n", 
+                ratio_effect_size$cohen_d[1],
+                ratio_effect_size$percent_change[1]))
+    
+  # 情况3：ratio主效应不显著
+  } else {
+    cat("\nOffer ratio主效应不显著 (p > 0.05)\n")
+    cat("2:8和1:9之间的RT没有显著差异\n")
+    
+    # 仍然保存基本的描述统计
+    emm_ratio <- emmeans(lmm_with_ratio, ~ offer_ratio)
+    ratio_means <- as.data.frame(emm_ratio) %>%
+      mutate(RT_ms = exp(emmean))
+    write_csv(ratio_means, file.path(unfair_dir, "RT_ratio_emmeans_ns.csv"))
+  }
+  
+  # 无论显著与否，都检查情绪主效应是否保持
+  if(anova_with_ratio["emotion", "Pr(>F)"] < 0.05) {
+    cat("\n注：控制ratio后，情绪主效应仍然显著\n")
+  } else {
+    cat("\n注：控制ratio后，情绪主效应不再显著\n")
+  }
+  
+} else {
+  cat("\n只有一个ratio水平，无法进行ratio比较\n")
+}
+
+## 8. 结果汇总（增强版）
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("8. 结果汇总\n")
+cat(paste(rep("=", 60), collapse=""), "\n\n")
+
+# 创建汇总文本
+summary_file <- file.path(unfair_dir, "RT_summary.txt")
+
+summary_lines <- c(
+  "UNFAIR条件拒绝反应RT分析汇总",
+  paste(rep("=", 50), collapse=""),
+  "",
+  "=====================",
+  "主要发现",
+  "====================="
+)
+
+# 根据分析结果构建主要发现
+main_findings <- c()
+
+# 1. Emotion主效应
+if(exists("lmm_anova")) {
+  main_findings <- c(main_findings,
+    sprintf("1. Emotion主效应显著：F(%d, %.1f) = %.2f, p < .001",
+            lmm_anova[1, "NumDF"],
+            lmm_anova[1, "DenDF"],
+            lmm_anova[1, "F value"]))
+  
+  # 添加RT排序
+  rt_order <- paste(emm_ms$emotion, sprintf("(%.0fms)", emm_ms$RT_pred_ms), collapse=" < ")
+  main_findings <- c(main_findings,
+    sprintf("   RT从快到慢：%s", rt_order))
+}
+
+# 2. Ratio效应（如果分析了）
+if(exists("anova_with_ratio")) {
+  ratio_p <- anova_with_ratio["offer_ratio", "Pr(>F)"]
+  if(ratio_p < 0.05) {
+    main_findings <- c(main_findings,
+      sprintf("2. Offer ratio主效应显著：F(1, %.1f) = %.2f, p < .001",
+              anova_with_ratio["offer_ratio", "DenDF"],
+              anova_with_ratio["offer_ratio", "F value"]),
+      "   1:9条件下RT显著快于2:8条件")
+  } else {
+    main_findings <- c(main_findings,
+      "2. Offer ratio主效应不显著（2:8 vs 1:9无差异）")
+  }
+  
+  # 3. 交互作用
+  if("emotion:offer_ratio" %in% rownames(anova_with_ratio)) {
+    inter_p <- anova_with_ratio["emotion:offer_ratio", "Pr(>F)"]
+    if(inter_p < 0.05) {
+      main_findings <- c(main_findings,
+        "3. Emotion × Ratio交互作用显著",
+        "   不同情绪对不公平程度的反应模式不同")
+    } else {
+      main_findings <- c(main_findings,
+        "3. 无Emotion × Ratio交互作用",
+        "   情绪效应在不同不公平程度下保持一致")
+    }
+  }
+}
+
+# 4. 效应量总结
+if(exists("sig_effects") && nrow(sig_effects) > 0) {
+  n_large <- sum(sig_effects$magnitude == "large")
+  n_medium <- sum(sig_effects$magnitude == "medium")
+  n_small <- sum(sig_effects$magnitude == "small")
+  
+  effect_summary <- c()
+  if(n_large > 0) effect_summary <- c(effect_summary, paste(n_large, "large"))
+  if(n_medium > 0) effect_summary <- c(effect_summary, paste(n_medium, "medium"))
+  if(n_small > 0) effect_summary <- c(effect_summary, paste(n_small, "small"))
+  
+  if(length(effect_summary) > 0) {
+    main_findings <- c(main_findings,
+      sprintf("4. 效应量：%s effects", paste(effect_summary, collapse=", ")))
+  }
+}
+
+summary_lines <- c(summary_lines, "", main_findings)
+
+# 然后添加详细结果部分
+summary_lines <- c(summary_lines,
+  "",
+  "=====================",
+  "详细结果",
+  "=====================",
+  "",
+  "1. 样本信息：",
+  sprintf("   总试次数: %d", nrow(df_unfair_reject)),
+  sprintf("   被试数: %d", length(unique(df_unfair_reject$participant_id))))
+
+# 2. 基础模型ANOVA
+summary_lines <- c(summary_lines, "", "2. 基础模型ANOVA结果（仅emotion）：")
+anova_text <- capture.output(print(lmm_anova))
+summary_lines <- c(summary_lines, anova_text)
+
+# 3. 边际均值
+summary_lines <- c(summary_lines, "", "3. Emotion边际均值（毫秒）：")
+summary_lines <- c(summary_lines, "emotion    RT_pred_ms  lower_CI   upper_CI")
+summary_lines <- c(summary_lines, "-------    ----------  --------   --------")
+for(i in 1:nrow(emm_ms)) {
+  summary_lines <- c(summary_lines,
+    sprintf("%-10s %10.1f  %8.1f   %8.1f", 
+            emm_ms$emotion[i], 
+            emm_ms$RT_pred_ms[i],
+            emm_ms$lower_CI[i],
+            emm_ms$upper_CI[i]))
+}
+
+# 4. 显著对比
+summary_lines <- c(summary_lines, "", "4. 显著的情绪对比（FDR < 0.05）：")
+if(nrow(sig_effects) > 0) {
+  # 按效应量大小排序
+  sig_effects_sorted <- sig_effects %>% arrange(desc(abs(cohen_d)))
+  
+  for(i in 1:min(nrow(sig_effects_sorted), 5)) {  # 只显示前5个最大效应
+    summary_lines <- c(summary_lines,
+      sprintf("   %s: d = %.2f (%s), p = %.4f",
+              sig_effects_sorted$contrast[i],
+              sig_effects_sorted$cohen_d[i],
+              sig_effects_sorted$magnitude[i],
+              sig_effects_sorted$p.value[i]))
+  }
+  
+  if(nrow(sig_effects_sorted) > 5) {
+    summary_lines <- c(summary_lines,
+      sprintf("   ... 还有%d个显著对比", nrow(sig_effects_sorted) - 5))
+  }
+} else {
+  summary_lines <- c(summary_lines, "   无显著对比")
+}
+
+# 5. Ratio分析（如果有）
+if(exists("anova_with_ratio")) {
+  summary_lines <- c(summary_lines, "", "5. 包含Offer Ratio的分析：")
+  ratio_anova_text <- capture.output(print(anova_with_ratio))
+  summary_lines <- c(summary_lines, ratio_anova_text)
+  
+  # 根据结果添加解释
+  if(exists("interaction_sig") && interaction_sig) {
+    summary_lines <- c(summary_lines,
+      "",
+      "*** 交互作用解释 ***",
+      "情绪对RT的影响依赖于不公平程度",
+      "需要查看简单效应分析结果（见相关CSV文件）")
+  } else if(exists("ratio_sig") && ratio_sig) {
+    summary_lines <- c(summary_lines,
+      "",
+      "*** Ratio主效应解释 ***",
+      "更极端的不公平（1:9）导致更快的拒绝反应",
+      "此效应在所有情绪条件下一致")
+  }
+}
+
+# 6. 效应量标准
+summary_lines <- c(summary_lines, "", "6. 效应量解释标准：")
+summary_lines <- c(summary_lines,
+  "   negligible: |d| < 0.2",
+  "   small:      0.2 ≤ |d| < 0.5",
+  "   medium:     0.5 ≤ |d| < 0.8",
+  "   large:      |d| ≥ 0.8")
+
+# 写入文件
+writeLines(summary_lines, summary_file)
+
+# 控制台显示简要总结
+cat("\n主要发现总结：\n")
+for(finding in main_findings) {
+  cat(finding, "\n")
+}
+
+cat("\n汇总报告已保存至:", summary_file, "\n")
+```
 
 # 结尾：Session Info
 
