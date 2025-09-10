@@ -329,3 +329,262 @@ for analysis_type in analysis_types:
             plt.close(fig)
 
 print("\n全部.tiff格式的可视化图片已自动输出至 analysis_output/results_refuse/ratio 和 type 下！")
+
+# ============================================
+# Part 3: Unfair条件下拒绝反应的RT可视化
+# ============================================
+
+print("\n=== Part 3: Unfair条件拒绝反应RT可视化 ===")
+
+# 设置Part 3的目录
+unfair_dir = results_root / "unfair_reject"
+
+# 检查目录和文件是否存在
+if unfair_dir.exists():
+    required_files = [
+        "RT_descriptives.csv",
+        "RT_emmeans.csv",
+        "RT_effect_sizes.csv",
+        "RT_by_subject.csv"
+    ]
+    
+    if all((unfair_dir / f).exists() for f in required_files):
+        
+        # 读取数据
+        desc_stats = pd.read_csv(unfair_dir / "RT_descriptives.csv")
+        emmeans = pd.read_csv(unfair_dir / "RT_emmeans.csv")
+        effect_sizes = pd.read_csv(unfair_dir / "RT_effect_sizes.csv")
+        by_subject = pd.read_csv(unfair_dir / "RT_by_subject.csv")
+        
+        # 确保情绪顺序正确
+        emmeans['emotion'] = pd.Categorical(emmeans['emotion'], categories=emotion_order, ordered=True)
+        emmeans = emmeans.sort_values('emotion')
+        
+        # ========== 图1: 主效应条形图 ==========
+        fig, ax = plt.subplots(figsize=(7, 5))
+        
+        x_pos = np.arange(len(emmeans))
+        colors_list = [emotion_colors[e] for e in emmeans['emotion']]
+        
+        bars = ax.bar(x_pos, emmeans['RT_pred_ms'], 
+                      color=colors_list, edgecolor='black', linewidth=1.5, alpha=0.8)
+        
+        # 添加误差线
+        errors = [(emmeans['RT_pred_ms'] - emmeans['lower_CI']).values,
+                  (emmeans['upper_CI'] - emmeans['RT_pred_ms']).values]
+        ax.errorbar(x_pos, emmeans['RT_pred_ms'], yerr=errors,
+                    fmt='none', color='black', capsize=5, linewidth=1.5)
+        
+        # 在条形上方添加数值
+        for i, (val, bar) in enumerate(zip(emmeans['RT_pred_ms'], bars)):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 15,
+                    f'{val:.0f}', ha='center', va='bottom', fontsize=10)
+        
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([full_label[e] for e in emmeans['emotion']], rotation=0)
+        ax.set_ylabel('Predicted RT (ms)', fontsize=12)
+        ax.set_ylim(800, 1100)
+        ax.set_title('Unfair Rejection RT: Model Predictions with 95% CI', fontsize=13, fontweight='bold')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        plt.tight_layout()
+        plt.savefig(unfair_dir / "RT_bars.tiff", dpi=220)
+        plt.close(fig)
+        
+        # ========== 图2: 小提琴图（个体数据）==========
+        fig, ax = plt.subplots(figsize=(8, 5))
+        
+        # 准备数据
+        by_subject['emotion'] = pd.Categorical(by_subject['emotion'], categories=emotion_order, ordered=True)
+        by_subject_sorted = by_subject.sort_values('emotion')
+        
+        # 绘制小提琴图
+        violin_data = []
+        for emo in emotion_order:
+            data = by_subject_sorted[by_subject_sorted['emotion']==emo]['mean_RT'].values
+            if len(data) > 0:
+                violin_data.append(data)
+            else:
+                violin_data.append([])
+        
+        parts = ax.violinplot(
+            [d for d in violin_data if len(d) > 0],
+            positions=[i for i, d in enumerate(violin_data) if len(d) > 0],
+            widths=0.7,
+            showmeans=False,
+            showextrema=False
+        )
+        
+        # 设置小提琴颜色
+        for i, pc in enumerate(parts['bodies']):
+            valid_idx = [j for j, d in enumerate(violin_data) if len(d) > 0][i]
+            pc.set_facecolor(emotion_colors[emotion_order[valid_idx]])
+            pc.set_alpha(0.4)
+            pc.set_edgecolor('black')
+            pc.set_linewidth(1)
+        
+        # 添加个体数据点
+        for i, emo in enumerate(emotion_order):
+            y = by_subject_sorted[by_subject_sorted['emotion']==emo]['mean_RT'].values
+            if len(y) > 0:
+                x = np.random.normal(i, 0.08, size=len(y))
+                ax.scatter(x, y, alpha=0.6, s=20, color='gray', zorder=3)
+        
+        # 添加均值和误差线
+        means = by_subject_sorted.groupby('emotion')['mean_RT'].mean().reindex(emotion_order)
+        sems = by_subject_sorted.groupby('emotion')['mean_RT'].sem().reindex(emotion_order)
+        
+        for i, emo in enumerate(emotion_order):
+            if not pd.isna(means[emo]):
+                ax.scatter(i, means[emo], color='black', s=100, zorder=5, marker='D')
+                ax.errorbar(i, means[emo], yerr=1.96*sems[emo],
+                           fmt='none', color='black', capsize=5, linewidth=2, zorder=4)
+        
+        # 添加模型预测值（红色菱形）
+        for i, emo in enumerate(emotion_order):
+            if emo in emmeans['emotion'].values:
+                pred_val = emmeans[emmeans['emotion']==emo]['RT_pred_ms'].values[0]
+                ax.scatter(i, pred_val, color='red', s=120, zorder=6, marker='D', 
+                          edgecolors='darkred', linewidth=1.5)
+        
+        ax.set_xticks(np.arange(len(emotion_order)))
+        ax.set_xticklabels([full_label[e] for e in emotion_order])
+        ax.set_ylabel('Mean RT (ms)', fontsize=12)
+        ax.set_ylim(600, 1400)
+        ax.set_title('Individual Participant Data: Unfair Rejection RT\nBlack: observed mean ± 95% CI | Red: model prediction', 
+                     fontsize=11)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        # 添加图例
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='D', color='w', markerfacecolor='black', markersize=8, label='Observed mean'),
+            Line2D([0], [0], marker='D', color='w', markerfacecolor='red', markersize=8, label='Model prediction')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', frameon=False)
+        
+        plt.tight_layout()
+        plt.savefig(unfair_dir / "RT_violin.tiff", dpi=220)
+        plt.close(fig)
+        
+        # ========== 图3: 效应量森林图 ==========
+        fig, ax = plt.subplots(figsize=(8, 6))
+        
+        # 筛选显著效应
+        sig_effects = effect_sizes[effect_sizes['p.value'] < 0.05].copy()
+        
+        if len(sig_effects) > 0:
+            sig_effects = sig_effects.sort_values('cohen_d')
+            y_pos = np.arange(len(sig_effects))
+            
+            # 根据p值设置颜色
+            colors_eff = []
+            for p in sig_effects['p.value']:
+                if p < 0.001:
+                    colors_eff.append('#d73027')  # 深红
+                elif p < 0.01:
+                    colors_eff.append('#fc8d59')  # 橙色
+                else:
+                    colors_eff.append('#fee090')  # 浅黄
+            
+            ax.barh(y_pos, sig_effects['cohen_d'], 
+                    color=colors_eff, edgecolor='black', linewidth=1, alpha=0.8)
+            
+            # 添加误差线（如果有SE）
+            if 'SE' in sig_effects.columns:
+                errors = 1.96 * sig_effects['SE'] / 0.2729  # 使用模型的残差标准差
+                ax.errorbar(sig_effects['cohen_d'], y_pos, xerr=errors,
+                           fmt='none', color='black', capsize=3, linewidth=1)
+            
+            # 添加参考线
+            ax.axvline(0, color='gray', linestyle='-', linewidth=1)
+            ax.axvline(-0.2, color='gray', linestyle='--', alpha=0.5, linewidth=0.8)
+            ax.axvline(-0.5, color='gray', linestyle='--', alpha=0.5, linewidth=0.8)
+            
+            # 添加标签
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(sig_effects['contrast'])
+            ax.set_xlabel("Cohen's d", fontsize=12)
+            ax.set_title("Effect Sizes for Significant Contrasts (FDR < 0.05)\nNegative = faster RT", 
+                        fontsize=12, fontweight='bold')
+            
+            # 添加效应量分类文字
+            ax.text(-0.35, ax.get_ylim()[1] * 0.95, 'Small', fontsize=9, alpha=0.7)
+            ax.text(-0.65, ax.get_ylim()[1] * 0.95, 'Medium', fontsize=9, alpha=0.7)
+            
+            # 添加图例
+            from matplotlib.patches import Patch
+            legend_elements = [
+                Patch(facecolor='#d73027', edgecolor='black', label='p < 0.001'),
+                Patch(facecolor='#fc8d59', edgecolor='black', label='p < 0.01'),
+                Patch(facecolor='#fee090', edgecolor='black', label='p < 0.05')
+            ]
+            ax.legend(handles=legend_elements, loc='lower right', frameon=False)
+        else:
+            ax.text(0.5, 0.5, 'No significant effects (FDR < 0.05)', 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.grid(axis='x', alpha=0.3, linestyle='--')
+        
+        plt.tight_layout()
+        plt.savefig(unfair_dir / "RT_forest.tiff", dpi=220)
+        plt.close(fig)
+        
+        # ========== 图4: 效应量热力图 ==========
+        # 创建效应量矩阵
+        emotions_in_order = emotion_order
+        effect_matrix = np.zeros((5, 5))
+        
+        for _, row in effect_sizes.iterrows():
+            contrast = row['contrast']
+            if ' - ' in contrast:
+                emo1, emo2 = contrast.split(' - ')
+                if emo1 in emotions_in_order and emo2 in emotions_in_order:
+                    i = emotions_in_order.index(emo1)
+                    j = emotions_in_order.index(emo2)
+                    effect_matrix[i, j] = row['cohen_d']
+                    effect_matrix[j, i] = -row['cohen_d']
+        
+        # 创建mask（对角线）
+        mask = np.eye(5, dtype=bool)
+        
+        fig, ax = plt.subplots(figsize=(7, 6))
+        
+        sns.heatmap(effect_matrix, 
+                   mask=mask,
+                   annot=True, 
+                   fmt='.2f',
+                   cmap='RdBu_r',
+                   center=0,
+                   vmin=-0.5, vmax=0.5,
+                   square=True,
+                   linewidths=1,
+                   cbar_kws={'label': "Cohen's d", 'shrink': 0.8},
+                   ax=ax)
+        
+        ax.set_xticklabels([full_label[e] for e in emotions_in_order], rotation=45, ha='right')
+        ax.set_yticklabels([full_label[e] for e in emotions_in_order], rotation=0)
+        ax.set_title("Pairwise Effect Sizes: Unfair Rejection RT\n(Row - Column)", 
+                    fontsize=12, fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig(unfair_dir / "RT_heatmap.tiff", dpi=220)
+        plt.close(fig)
+        
+        print("Part 3 可视化完成！图片保存在 analysis_output/results_refuse/unfair_reject/")
+        
+    else:
+        print("警告：Part 3 某些必要文件缺失，跳过可视化")
+        for f in required_files:
+            if not (unfair_dir / f).exists():
+                print(f"  缺失文件: {f}")
+else:
+    print("警告：unfair_reject 文件夹不存在，跳过Part 3可视化")
+
+print("\n所有可视化完成！")
