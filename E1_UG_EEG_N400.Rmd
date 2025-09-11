@@ -1,0 +1,696 @@
+---
+title: "N400 Component Analysis: Complete Statistical Framework"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+``` {r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# 设置工作目录
+setwd("D:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG")
+
+library(reticulate)
+use_condaenv("r-reticulate", required = TRUE)
+
+# 强制加载本地pipeline并修复问题
+py_run_string("
+import sys
+import os
+import re
+
+# 清理所有已加载的pipeline模块
+pipeline_modules = [key for key in list(sys.modules.keys()) if 'pipeline' in key]
+for module in pipeline_modules:
+    del sys.modules[module]
+print(f'Cleared {len(pipeline_modules)} pipeline modules')
+
+# 添加本地路径到最前面
+local_path = r'D:\\PD_E1_UG_jg\\EEG_R_Python_Pipeline_JG_Backup\\hu-neuro-pipeline'
+if local_path in sys.path:
+    sys.path.remove(local_path)
+sys.path.insert(0, local_path)
+
+# 导入pipeline
+import pipeline
+print(f'Pipeline loaded from: {pipeline.__file__}')
+
+# 修复epoching.py中的事件标记问题
+from pipeline import epoching
+
+def get_events_fixed(raw, triggers):
+    '''修复版本：处理S格式的事件标记'''
+    from mne import events_from_annotations
+    
+    events, event_id = events_from_annotations(raw)
+    
+    # 从事件标记提取数字
+    def extract_number(key):
+        match = re.search(r'\\d+', str(key))
+        return int(match.group()) if match else None
+    
+    # 过滤事件
+    filtered_event_id = {}
+    for key, value in event_id.items():
+        trigger_num = extract_number(key)
+        if trigger_num and trigger_num in triggers:
+            filtered_event_id[key] = value
+    
+    return events, filtered_event_id
+
+# 替换原函数
+epoching.get_events = get_events_fixed
+print('Applied event extraction fix')
+")
+
+pipeline <- import("pipeline")
+```
+
+# 1. Load Required Packages
+
+``` {r packages}
+# 基础包
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(stringr)
+
+# 统计包
+library(lme4)
+library(lmerTest)
+library(afex)
+afex_options(emmeans_model = "multivariate") # 设置emmeans选项
+library(emmeans)
+library(performance)
+library(effectsize)
+library(parameters)
+library(car)
+library(gridExtra)
+library(ggpubr)
+```
+
+# 2. Data Preprocessing
+
+``` {r preprocess-logs, include=FALSE}
+orig_logs <- list.files("data/csv_all", pattern = "\\.txt$", full.names = TRUE)
+out_dir <- "data/csv_filtered"
+out_summary <- "data/csv_summaryPostRating"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_summary, showWarnings = FALSE, recursive = TRUE)
+
+for (fpath in orig_logs) {
+  fb <- file(fpath, "rb")
+  bom <- readBin(fb, "raw", n = 2)
+  close(fb)
+  encoding <- if(length(bom) == 2 && identical(bom, as.raw(c(0xFF, 0xFE)))) "UTF-16LE" else "UTF-8"
+  
+  df <- read_delim(fpath, delim = "\t", col_types = cols(), 
+                   show_col_types = FALSE, locale = locale(encoding = encoding))
+  
+  n <- nrow(df)
+  df_trials <- df %>% slice(1:(n-3)) %>% filter(block != 7) %>%
+    mutate(emotion = str_extract(stim, "enj|dis|dom|neu|aff"))
+  df_summary <- df %>% slice((n-2):n)
+  
+  out_name <- paste0(tools::file_path_sans_ext(basename(fpath)), ".csv")
+  out_name_summary <- paste0(tools::file_path_sans_ext(basename(fpath)), "_summaryPostRating.csv")
+  write_csv(df_trials, file.path(out_dir, out_name))
+  write_csv(df_summary, file.path(out_summary, out_name_summary))
+}
+```
+
+# 3. N400 Component Extraction
+
+``` {r n400-extraction}
+res_n400 <- pipeline$group_pipeline(
+  raw_files     = "data/raw_all_cropped",
+  log_files     = "data/csv_filtered",
+  output_dir    = "export/n400_analysis",
+  ica_method    = "fastica",
+  ica_n_components = 0.99,
+  triggers      = c(10:89, 150:169),
+  bad_channels  = "auto",
+  highpass_freq = 0.05,
+  lowpass_freq  = 30.0,
+  reject_peak_to_peak= 200.0,
+  components    = list(
+    name = list("N400"),
+    tmin = list(0.350),
+    tmax = list(0.500),
+    roi  = list(c("Fz","Cz","CPz","Pz"))
+  ),
+  average_by = list(
+    Face_enj_5_5 = "emotion=='enj' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_5_5 = "emotion=='dis' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_5_5 = "emotion=='dom' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_5_5 = "emotion=='neu' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_5_5 = "emotion=='aff' & Offers_Other==5 & Offers_You==5 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_6_4 = "emotion=='enj' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_6_4 = "emotion=='dis' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_6_4 = "emotion=='dom' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_6_4 = "emotion=='neu' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_6_4 = "emotion=='aff' & Offers_Other==6 & Offers_You==4 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_7_3 = "emotion=='enj' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_7_3 = "emotion=='dis' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_7_3 = "emotion=='dom' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_7_3 = "emotion=='neu' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_7_3 = "emotion=='aff' & Offers_Other==7 & Offers_You==3 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_8_2 = "emotion=='enj' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_8_2 = "emotion=='dis' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_8_2 = "emotion=='dom' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_8_2 = "emotion=='neu' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_8_2 = "emotion=='aff' & Offers_Other==8 & Offers_You==2 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_enj_9_1 = "emotion=='enj' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dis_9_1 = "emotion=='dis' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_dom_9_1 = "emotion=='dom' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_neu_9_1 = "emotion=='neu' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000",
+    Face_aff_9_1 = "emotion=='aff' & Offers_Other==9 & Offers_You==1 & reaction>0 & RT >= 150 & RT <= 3000"
+  )
+)
+
+trials_n400  <- res_n400[[1]]
+evokeds_n400 <- res_n400[[2]]
+config_n400  <- res_n400[[3]]
+
+cat("N400 extraction completed!\n")
+```
+
+# 4. Data Preparation
+
+``` {r data-preparation}
+# 重新加载必要的包
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(afex)
+library(emmeans)
+library(performance)
+library(effectsize)
+library(car)
+library(gridExtra)
+
+# 设置工作目录
+setwd("D:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG")
+
+# 从pipeline输出文件读取数据
+trials_n400 <- read_csv("export/n400_analysis/grand_ave.csv")
+
+# 或者如果之前保存了RData文件
+# load("export/n400_analysis/n400_workspace.RData")
+# 确保输出目录存在
+dir.create("export/n400_analysis", showWarnings = FALSE, recursive = TRUE)
+
+# 准备分析数据
+n400_data <- trials_n400 %>%
+  filter(Offers_You != 3) %>%  # 排除7:3条件
+  mutate(
+    offer_type = factor(case_when(
+      Offers_You %in% c(5, 4) ~ "Fair",
+      Offers_You %in% c(2, 1) ~ "Unfair"
+    ), levels = c("Fair", "Unfair")),
+    emotion = factor(emotion),
+    subject = factor(subject)
+  ) %>%
+  group_by(subject, emotion, offer_type) %>%
+  summarise(N400 = mean(N400, na.rm = TRUE), .groups = "drop")
+
+# 数据完整性检查
+missing_check <- n400_data %>%
+  count(subject, emotion) %>%
+  filter(n < 2)  # 应该每个emotion有2个offer_type
+
+if(nrow(missing_check) > 0) {
+  cat("\nWarning: Incomplete data detected\n")
+  print(missing_check)
+}
+
+# 数据概览
+cat("\n=== Dataset Overview ===\n")
+cat("Subjects:", n_distinct(n400_data$subject), "\n")
+cat("Design: 5 (emotion) × 2 (offer_type) within-subjects\n")
+cat("Total observations:", nrow(n400_data), "\n\n")
+print(with(n400_data, table(emotion, offer_type)))
+```
+
+# 5. Assumption Checks
+
+``` {r assumptions, fig.width=10, fig.height=5}
+cat("\n=== ASSUMPTION CHECKS ===\n")
+
+# 正态性检验
+residuals_lm <- residuals(lm(N400 ~ emotion * offer_type, data = n400_data))
+
+# Shapiro-Wilk检验
+sw_test <- shapiro.test(sample(residuals_lm, min(5000, length(residuals_lm))))
+cat("\nShapiro-Wilk normality test:\n")
+cat(sprintf("W = %.4f, p = %.4f\n", sw_test$statistic, sw_test$p.value))
+
+# 图形诊断
+par(mfrow = c(1, 2))
+qqnorm(residuals_lm, main = "Q-Q Plot")
+qqline(residuals_lm, col = "red")
+hist(residuals_lm, breaks = 20, main = "Histogram of Residuals", 
+     xlab = "Residuals", col = "lightblue")
+par(mfrow = c(1, 1))
+
+# 方差齐性检验
+levene_result <- leveneTest(N400 ~ emotion * offer_type, data = n400_data)
+cat("\nLevene's test for homogeneity of variance:\n")
+print(levene_result)
+```
+
+# 6. Method 1: Linear Mixed Models (LMM)
+
+``` {r lmm-analysis}
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("LINEAR MIXED MODELS ANALYSIS\n")
+cat(paste(rep("=", 60), collapse=""), "\n\n")
+
+# Model 1: 随机截距模型
+lmm1 <- lmer(N400 ~ emotion * offer_type + (1 | subject), 
+             data = n400_data, REML = TRUE)
+
+# Model 2: 随机截距+斜率模型（尝试）
+lmm2 <- NULL
+lmm2_converged <- FALSE
+
+tryCatch({
+  lmm2 <- lmer(N400 ~ emotion * offer_type + (1 + offer_type | subject), 
+               data = n400_data, REML = TRUE,
+               control = lmerControl(optimizer = "bobyqa", 
+                                    optCtrl = list(maxfun = 100000)))
+  lmm2_converged <- TRUE
+  cat("Model 2 converged successfully\n")
+}, warning = function(w) {
+  cat("Model 2 warning:", conditionMessage(w), "\n")
+}, error = function(e) {
+  cat("Model 2 failed to converge\n")
+})
+
+# 展示Model 1结果
+cat("\n--- Model 1: Random Intercept ---\n")
+print(summary(lmm1))
+
+# Type III ANOVA
+cat("\n--- Type III ANOVA ---\n")
+lmm_anova <- anova(lmm1, type = 3)
+print(lmm_anova)
+
+# 模型比较（如果Model 2收敛）
+if(lmm2_converged && !is.null(lmm2)) {
+  cat("\n--- Model Comparison ---\n")
+  print(anova(lmm1, lmm2))
+}
+
+# 模型诊断
+cat("\n--- Model Diagnostics ---\n")
+cat("ICC:", round(icc(lmm1)$ICC_adjusted, 3), "\n")
+cat("Marginal R²:", round(r2_nakagawa(lmm1)$R2_marginal, 3), "\n")
+cat("Conditional R²:", round(r2_nakagawa(lmm1)$R2_conditional, 3), "\n")
+```
+
+# 7. Method 2: Repeated Measures ANOVA
+
+``` {r rmanova-analysis}
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("REPEATED MEASURES ANOVA ANALYSIS\n")
+cat(paste(rep("=", 60), collapse=""), "\n\n")
+
+# RM-ANOVA
+rm_anova <- aov_ez(id = "subject",
+                   dv = "N400",
+                   data = n400_data,
+                   within = c("emotion", "offer_type"),
+                   type = 3,
+                   return = "afex_aov")
+
+# ANOVA表
+cat("--- ANOVA Table ---\n")
+print(summary(rm_anova))
+
+# 效应量
+cat("\n--- Effect Sizes (Partial Eta Squared) ---\n")
+es_anova <- effectsize::eta_squared(rm_anova, partial = TRUE)
+print(es_anova)
+
+# 球形假设检验（如果可用）
+if(!is.null(rm_anova$Anova)) {
+  cat("\n--- Sphericity Test ---\n")
+  spher_test <- summary(rm_anova)
+  if(!is.null(spher_test$sphericity.tests)) {
+    print(spher_test$sphericity.tests)
+  }
+}
+```
+
+# 8. Statistical Methods Comparison
+
+``` {r methods-comparison}
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("COMPARISON OF STATISTICAL METHODS\n")
+cat(paste(rep("=", 60), collapse=""), "\n\n")
+
+# 提取结果
+lmm_res <- lmm_anova
+anova_res <- rm_anova$anova_table
+
+# 创建比较表
+comparison_table <- data.frame(
+  Effect = c("Emotion", "Offer Type", "Emotion × Offer Type"),
+  LMM_F = round(lmm_res$`F value`[2:4], 3),
+  LMM_df1 = lmm_res$`NumDF`[2:4],
+  LMM_df2 = round(lmm_res$`DenDF`[2:4], 1),
+  LMM_p = round(lmm_res$`Pr(>F)`[2:4], 4),
+  ANOVA_F = round(anova_res$`F`[1:3], 3),
+  ANOVA_df1 = anova_res$`num Df`[1:3],
+  ANOVA_df2 = anova_res$`den Df`[1:3],
+  ANOVA_p = round(anova_res$`Pr(>F)`[1:3], 4),
+  ANOVA_pes = round(anova_res$pes[1:3], 3)
+)
+
+print(comparison_table)
+```
+
+# 9. Difference Wave Analysis
+
+``` {r difference-wave}
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("DIFFERENCE WAVE ANALYSIS (Unfair - Fair)\n")
+cat(paste(rep("=", 60), collapse=""), "\n\n")
+
+# 计算差异波
+diff_wave_data <- n400_data %>%
+  pivot_wider(names_from = offer_type, values_from = N400) %>%
+  mutate(
+    N400_diff = Unfair - Fair,  # Unfair - Fair
+    subject = factor(subject),
+    emotion = factor(emotion)
+  )
+
+# 描述统计
+diff_summary <- diff_wave_data %>%
+  group_by(emotion) %>%
+  summarise(
+    n = n(),
+    mean_diff = mean(N400_diff, na.rm = TRUE),
+    sd_diff = sd(N400_diff, na.rm = TRUE),
+    se_diff = sd_diff / sqrt(n),
+    ci_lower = mean_diff - qt(0.975, n-1) * se_diff,
+    ci_upper = mean_diff + qt(0.975, n-1) * se_diff,
+    .groups = "drop"
+  )
+
+cat("Difference Wave Descriptive Statistics:\n")
+print(diff_summary)
+
+# 差异波的emotion主效应（等价于原始交互作用）
+cat("\n--- Testing Emotion Effect on Difference Wave (Interaction Test) ---\n\n")
+
+# 方法1：LMM
+diff_lmm <- lmer(N400_diff ~ emotion + (1 | subject), data = diff_wave_data)
+cat("LMM on Difference Wave:\n")
+diff_lmm_anova <- anova(diff_lmm)
+print(diff_lmm_anova)
+
+# 方法2：RM-ANOVA
+diff_rm_anova <- aov_ez(id = "subject", 
+                        dv = "N400_diff",
+                        data = diff_wave_data,
+                        within = "emotion",
+                        type = 3)
+cat("\nRM-ANOVA on Difference Wave:\n")
+print(summary(diff_rm_anova))
+
+# 单样本t检验（每个emotion的差异波是否不等于0）
+cat("\n--- One-sample t-tests (H0: diff = 0) ---\n")
+t_test_results <- diff_wave_data %>%
+  group_by(emotion) %>%
+  do({
+    t_res <- t.test(.$N400_diff, mu = 0)
+    data.frame(
+      mean_diff = t_res$estimate,
+      t_value = t_res$statistic,
+      df = t_res$parameter,
+      p_value = t_res$p.value,
+      cohen_d = t_res$estimate / sd(.$N400_diff)
+    )
+  }) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "bonferroni"),
+    sig = case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01 ~ "**", 
+      p_adj < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+print(as.data.frame(t_test_results))
+```
+
+# 10. Post-hoc Analyses
+
+``` {r posthoc}
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("POST-HOC ANALYSES\n")
+cat(paste(rep("=", 60), collapse=""), "\n\n")
+
+# 原始数据的事后检验
+if(lmm_anova$`Pr(>F)`[4] < 0.05) {  # 如果交互作用显著
+  cat("--- Significant Interaction: Simple Effects Analysis ---\n\n")
+  
+  # Emotion在每个offer_type水平的简单效应
+  cat("Simple effect of Emotion:\n")
+  emm_emotion <- emmeans(lmm1, ~ emotion | offer_type)
+  print(pairs(emm_emotion, adjust = "bonferroni"))
+  
+  # Offer_type在每个emotion水平的简单效应
+  cat("\nSimple effect of Offer Type:\n")
+  emm_offer <- emmeans(lmm1, ~ offer_type | emotion)
+  print(pairs(emm_offer, adjust = "bonferroni"))
+}
+
+# 差异波的事后检验（如果emotion效应显著）
+if(diff_lmm_anova$`Pr(>F)`[1] < 0.05) {
+  cat("\n--- Difference Wave: Pairwise Comparisons ---\n")
+  emm_diff <- emmeans(diff_lmm, ~ emotion)
+  diff_pairs <- pairs(emm_diff, adjust = "bonferroni")
+  print(diff_pairs)
+}
+
+# 主效应（如果需要）
+cat("\n--- Main Effects ---\n")
+cat("Main effect of Emotion:\n")
+emm_emotion_main <- emmeans(lmm1, ~ emotion)
+print(pairs(emm_emotion_main, adjust = "bonferroni"))
+
+cat("\nMain effect of Offer Type:\n")
+emm_offer_main <- emmeans(lmm1, ~ offer_type)
+print(pairs(emm_offer_main, adjust = "bonferroni"))
+```
+
+# 11. Comprehensive Visualization
+
+``` {r visualization, fig.width=15, fig.height=12}
+# 设置颜色
+colors <- c("enj" = "#2ecc71", "dis" = "#e74c3c", "dom" = "#9b59b6", 
+            "neu" = "#95a5a6", "aff" = "#3498db")
+
+# 准备绘图数据
+plot_summary <- n400_data %>%
+  group_by(emotion, offer_type) %>%
+  summarise(
+    mean = mean(N400),
+    se = sd(N400) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# 图1：交互作用图（带个体数据）
+p1 <- ggplot(plot_summary, aes(x = offer_type, y = mean, 
+                                color = emotion, group = emotion)) +
+  geom_point(data = n400_data, aes(y = N400), 
+             alpha = 0.15, size = 1, 
+             position = position_jitterdodge(jitter.width = 0.05, dodge.width = 0.2)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), 
+                width = 0.1, size = 0.8) +
+  scale_color_manual(values = colors) +
+  labs(title = "N400 Amplitude: Emotion × Offer Type Interaction",
+       subtitle = "Individual data points shown",
+       x = "Offer Type", y = "N400 Amplitude (μV)") +
+  theme_minimal() +
+  theme(legend.position = "bottom", text = element_text(size = 12))
+
+# 图2：差异波条形图
+p2 <- ggplot(diff_summary, aes(x = emotion, y = mean_diff, fill = emotion)) +
+  geom_bar(stat = "identity", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_diff - se_diff, ymax = mean_diff + se_diff), 
+                width = 0.2, size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text(data = t_test_results, 
+            aes(label = sig, y = mean_diff + sign(mean_diff) * 0.4),
+            size = 5) +
+  scale_fill_manual(values = colors) +
+  labs(title = "Difference Wave (Unfair - Fair)",
+       subtitle = "* p<0.05, ** p<0.01, *** p<0.001 (Bonferroni corrected)",
+       x = "Emotion", y = "N400 Difference (μV)") +
+  theme_minimal() +
+  theme(legend.position = "none", text = element_text(size = 12))
+
+# 图3：差异波小提琴图
+p3 <- ggplot(diff_wave_data, aes(x = emotion, y = N400_diff, fill = emotion)) +
+  geom_violin(alpha = 0.4) +
+  geom_boxplot(width = 0.2, alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.3, size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", alpha = 0.5) +
+  scale_fill_manual(values = colors) +
+  labs(title = "Distribution of Difference Waves",
+       x = "Emotion", y = "N400 Difference (μV)") +
+  theme_minimal() +
+  theme(legend.position = "none", text = element_text(size = 12))
+
+# 图4：主效应
+# Emotion主效应
+emotion_main <- plot_summary %>%
+  group_by(emotion) %>%
+  summarise(mean = mean(mean), se = mean(se))
+
+p4a <- ggplot(emotion_main, aes(x = emotion, y = mean, fill = emotion)) +
+  geom_bar(stat = "identity", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+  scale_fill_manual(values = colors) +
+  labs(title = "Main Effect: Emotion", y = "N400 (μV)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Offer Type主效应
+offer_main <- plot_summary %>%
+  group_by(offer_type) %>%
+  summarise(mean = mean(mean), se = mean(se))
+
+p4b <- ggplot(offer_main, aes(x = offer_type, y = mean, fill = offer_type)) +
+  geom_bar(stat = "identity", alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+  scale_fill_manual(values = c("Fair" = "#27ae60", "Unfair" = "#c0392b")) +
+  labs(title = "Main Effect: Offer Type", y = "N400 (μV)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# 组合所有图
+library(gridExtra)
+grid.arrange(p1, p2, p3, arrangeGrob(p4a, p4b, ncol = 2), 
+             ncol = 2, nrow = 2,
+             heights = c(1, 1))
+```
+
+# 12. Export Results
+
+``` {r export-results}
+# 保存数据
+write_csv(n400_data, "export/n400_analysis/n400_statistical_data.csv")
+write_csv(diff_wave_data, "export/n400_analysis/n400_difference_wave.csv")
+write_csv(comparison_table, "export/n400_analysis/methods_comparison.csv")
+write_csv(as.data.frame(t_test_results), "export/n400_analysis/t_test_results.csv")
+
+# 保存图形
+ggsave("export/n400_analysis/n400_interaction.png", p1, 
+       width = 10, height = 6, dpi = 300)
+ggsave("export/n400_analysis/n400_difference_wave.png", p2, 
+       width = 8, height = 6, dpi = 300)
+ggsave("export/n400_analysis/n400_distributions.png", p3, 
+       width = 8, height = 6, dpi = 300)
+
+# 保存文本报告
+sink("export/n400_analysis/statistical_report.txt")
+cat("=== N400 STATISTICAL ANALYSIS REPORT ===\n")
+cat("Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+
+cat("=== DATA SUMMARY ===\n")
+cat("Subjects:", n_distinct(n400_data$subject), "\n")
+cat("Design: 5 (emotion) × 2 (offer_type) within-subjects\n")
+cat("Time window: 350-450 ms\n")
+cat("ROI: Fz, Cz, CPz, Pz\n\n")
+
+cat("=== METHODS COMPARISON ===\n")
+print(comparison_table)
+
+cat("\n=== LMM RESULTS ===\n")
+print(summary(lmm1))
+
+cat("\n=== RM-ANOVA RESULTS ===\n")
+print(summary(rm_anova))
+
+cat("\n=== DIFFERENCE WAVE ANALYSIS ===\n")
+cat("Testing whether emotion modulates the fairness effect\n")
+print(diff_lmm_anova)
+
+cat("\n=== ONE-SAMPLE T-TESTS ===\n")
+print(as.data.frame(t_test_results))
+
+sink()
+
+# 保存R工作空间
+save.image(file = "export/n400_analysis/n400_complete_workspace.RData")
+
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("ANALYSIS COMPLETE\n")
+cat("Results saved to: export/n400_analysis/\n")
+cat(paste(rep("=", 60), collapse=""), "\n")
+```
+
+# 13. Summary Report
+
+``` {r summary}
+cat("\n=== ANALYSIS SUMMARY ===\n\n")
+
+# 主要发现
+cat("Key Findings:\n")
+cat("--------------\n")
+
+# 交互作用
+if(lmm_anova$`Pr(>F)`[4] < 0.05) {
+  cat("✓ Significant Emotion × Offer Type interaction detected\n")
+  cat("  This indicates emotion modulates fairness processing\n")
+} else {
+  cat("✗ No significant Emotion × Offer Type interaction\n")
+}
+
+# 主效应
+if(lmm_anova$`Pr(>F)`[2] < 0.05) {
+  cat("✓ Significant main effect of Emotion\n")
+}
+if(lmm_anova$`Pr(>F)`[3] < 0.05) {
+  cat("✓ Significant main effect of Offer Type\n")
+}
+
+# 差异波
+sig_emotions <- t_test_results %>% 
+  filter(p_adj < 0.05) %>% 
+  pull(emotion)
+
+if(length(sig_emotions) > 0) {
+  cat("\n✓ Significant fairness effects (Unfair - Fair) for:\n")
+  for(em in sig_emotions) {
+    cat("  -", as.character(em), "\n")
+  }
+}
+
+cat("\n=== END OF ANALYSIS ===\n")
+```
+```
+
+这个完整脚本包含：
+1. **双重统计方法**：LMM和RM-ANOVA的完整比较
+2. **差异波分析**：包含emotion对差异波的效应（等价于检验交互作用）
+3. **全面的事后检验**：简单效应、成对比较
+4. **完整的可视化**：交互图、差异波、分布图
+5. **详细的输出**：数据文件、图形、统计报告
+
+差异波分析中emotion的主效应实际上就是检验原始数据中emotion × offer_type的交互作用。

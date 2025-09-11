@@ -1,0 +1,599 @@
+---
+title: "LPP Emotion Comparison in Unfair-Reject Condition - Complete Analysis"
+author: "Jin Gao"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  lme4, lmerTest, emmeans, effectsize, performance, 
+  ggplot2, dplyr, tidyr, DHARMa, readxl, multcomp
+)
+options(scipen = 999, digits = 6)
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# Set working directory
+setwd("D:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG")
+```
+
+# Data Import and Preprocessing
+
+```{r data-import}
+# Set paths
+data_path <- "export/offer_lpp_accept_reject/trials.csv"
+output_dir <- "export/offer_lpp_accept_reject/Unfair_Reject_Emotion_Analysis"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Import LPP data
+data_lpp <- read.csv(data_path, stringsAsFactors = FALSE)
+
+# Check data structure
+cat("===== DATA STRUCTURE CHECK =====\n")
+cat("Number of rows in raw data:", nrow(data_lpp), "\n")
+cat("Column names in data:\n")
+print(names(data_lpp))
+cat("\n")
+
+# Basic data check
+cat("First few rows of data:\n")
+print(head(data_lpp[, c("participant_id", "emotion", "Offers_You", "reaction", "LPP")]))
+cat("\n")
+
+# Filter and prepare data (EXCLUDE Offers_You = 3)
+data_analysis <- data_lpp %>%
+  filter(!is.na(LPP) & 
+         reaction %in% c(1, 2) &
+         Offers_You %in% c(1, 2, 4, 5)) %>%  # Exclude Offers_You = 3
+  mutate(
+    participant_id = factor(participant_id),
+    response = factor(reaction, levels = c(1, 2), labels = c("Accept", "Reject")),
+    emotion = factor(emotion, levels = c("neu", "aff", "dis", "dom", "enj")),
+    offer_type = case_when(
+      Offers_You %in% c(5, 4) ~ "Fair",
+      Offers_You %in% c(2, 1) ~ "Unfair"
+    )
+  )
+
+# Data validation checks
+cat("===== DATA VALIDATION =====\n")
+cat("Unique emotions in data:", paste(unique(data_analysis$emotion), collapse=", "), "\n")
+cat("Unique offer types:", paste(unique(data_analysis$offer_type), collapse=", "), "\n")
+cat("Unique responses:", paste(unique(data_analysis$response), collapse=", "), "\n")
+cat("LPP value range: [", round(min(data_analysis$LPP, na.rm=TRUE), 2), 
+    ", ", round(max(data_analysis$LPP, na.rm=TRUE), 2), "]\n\n")
+
+# Check emotion distribution across all data
+emotion_check <- data_analysis %>%
+  group_by(emotion) %>%
+  summarise(
+    n = n(),
+    mean_LPP = mean(LPP, na.rm = TRUE),
+    sd_LPP = sd(LPP, na.rm = TRUE),
+    .groups = "drop"
+  )
+cat("Overall emotion distribution (all conditions):\n")
+print(emotion_check)
+cat("\n")
+
+cat("===== DATA OVERVIEW =====\n")
+cat("Total trials after filtering:", nrow(data_analysis), "\n")
+cat("Total participants:", n_distinct(data_analysis$participant_id), "\n")
+cat("LPP component: 400-800ms, electrodes: Pz, Cz, C1, C2, CP1, CP2\n\n")
+
+# Additional validation: Check if emotions are properly distributed
+cat("===== EMOTION VALIDATION IN UNFAIR CONDITION =====\n")
+unfair_emotion_check <- data_analysis %>%
+  filter(offer_type == "Unfair") %>%
+  group_by(emotion, response) %>%
+  summarise(
+    n = n(),
+    mean_LPP = mean(LPP, na.rm = TRUE),
+    sd_LPP = sd(LPP, na.rm = TRUE),
+    min_LPP = min(LPP, na.rm = TRUE),
+    max_LPP = max(LPP, na.rm = TRUE),
+    .groups = "drop"
+  )
+cat("Unfair condition emotion × response distribution:\n")
+print(unfair_emotion_check)
+cat("\n")
+
+# Specifically check Unfair-Reject
+unfair_reject_check <- data_analysis %>%
+  filter(offer_type == "Unfair" & response == "Reject") %>%
+  group_by(emotion) %>%
+  summarise(
+    n = n(),
+    mean = round(mean(LPP, na.rm = TRUE), 3),
+    sd = round(sd(LPP, na.rm = TRUE), 3),
+    var = round(var(LPP, na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+cat("Unfair-Reject specific check:\n")
+print(unfair_reject_check)
+
+# Check for data anomalies
+if(length(unique(round(unfair_reject_check$var, 2))) == 1) {
+  cat("\n*** WARNING: All emotions have nearly identical variance! ***\n")
+  cat("This suggests a potential data processing issue.\n\n")
+} else {
+  cat("\nVariances appear different across emotions (good sign).\n\n")
+}
+```
+
+# Trial Count Statistics by Condition
+
+```{r trial-counts}
+cat("===== TRIAL COUNTS BY CONDITION =====\n\n")
+
+# Detailed trial counts: Fair/Unfair × Accept/Reject × Emotion
+trial_counts <- data_analysis %>%
+  group_by(offer_type, response, emotion) %>%
+  summarise(
+    n_trials = n(),
+    n_subjects = n_distinct(participant_id),
+    .groups = "drop"
+  ) %>%
+  arrange(offer_type, response, emotion)
+
+# Create wide format for better readability
+trial_counts_wide <- trial_counts %>%
+  dplyr::select(-n_subjects) %>%  # Fixed: added dplyr::
+  pivot_wider(
+    names_from = c(offer_type, response),
+    values_from = n_trials,
+    values_fill = 0,
+    names_sep = "_"
+  ) %>%
+  mutate(
+    Total_Fair = Fair_Accept + Fair_Reject,
+    Total_Unfair = Unfair_Accept + Unfair_Reject,
+    Grand_Total = Total_Fair + Total_Unfair
+  )
+
+cat("Trial Counts by Emotion and Condition:\n")
+print(as.data.frame(trial_counts_wide))
+
+# Summary by offer type and response
+summary_counts <- data_analysis %>%
+  group_by(offer_type, response) %>%
+  summarise(
+    n_trials = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = response,
+    values_from = n_trials,
+    values_fill = 0
+  ) %>%
+  mutate(Total = Accept + Reject)
+
+cat("\n\nOverall Summary:\n")
+print(as.data.frame(summary_counts))
+
+# Save trial counts
+write.csv(trial_counts, file.path(output_dir, "trial_counts_detailed.csv"), row.names = FALSE)
+write.csv(trial_counts_wide, file.path(output_dir, "trial_counts_summary.csv"), row.names = FALSE)
+```
+
+# Main Analysis: Unfair-Reject Emotion Comparison
+
+```{r unfair-reject-analysis}
+cat("\n===== UNFAIR-REJECT EMOTION COMPARISON (LPP) =====\n\n")
+
+# Filter for Unfair-Reject condition only
+data_unfair_reject <- data_analysis %>%
+  filter(offer_type == "Unfair" & response == "Reject")
+
+cat("Unfair-Reject trials:", nrow(data_unfair_reject), "\n")
+cat("Participants with Unfair-Reject trials:", n_distinct(data_unfair_reject$participant_id), "\n\n")
+
+# Descriptive statistics by emotion
+desc_stats <- data_unfair_reject %>%
+  group_by(emotion) %>%
+  summarise(
+    n_trials = n(),
+    n_subjects = n_distinct(participant_id),
+    mean_LPP = mean(LPP),
+    sd_LPP = sd(LPP),
+    se_LPP = sd(LPP)/sqrt(n()),
+    median_LPP = median(LPP),
+    min_LPP = min(LPP),
+    max_LPP = max(LPP),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_LPP))  # LPP is typically positive, so arrange descending
+
+cat("Descriptive Statistics (Unfair-Reject):\n")
+print(as.data.frame(desc_stats))
+write.csv(desc_stats, file.path(output_dir, "descriptive_stats_unfair_reject.csv"), row.names = FALSE)
+```
+
+## Linear Mixed Model Analysis
+
+```{r lmm-emotion}
+cat("\n===== LINEAR MIXED MODEL =====\n")
+
+# Build the model
+# Try with random slopes first
+model_full <- tryCatch({
+  lmer(LPP ~ emotion + (emotion|participant_id), 
+       data = data_unfair_reject, REML = FALSE)
+}, error = function(e) NULL)
+
+# If random slopes fail or singular, use random intercepts only
+if(is.null(model_full) || isSingular(model_full)) {
+  cat("Using random intercepts model (random slopes failed or singular)\n")
+  model_full <- lmer(LPP ~ emotion + (1|participant_id), 
+                     data = data_unfair_reject, REML = FALSE)
+} else {
+  cat("Using random slopes model\n")
+}
+
+# Model summary
+cat("\nModel Summary:\n")
+print(summary(model_full))
+
+# ANOVA for main effect
+anova_result <- anova(model_full)
+cat("\n===== ANOVA Results =====\n")
+print(anova_result)
+
+# Save ANOVA results
+write.csv(as.data.frame(anova_result), 
+          file.path(output_dir, "ANOVA_emotion_effect.csv"), 
+          row.names = TRUE)
+
+# Model diagnostics
+cat("\n===== Model Diagnostics =====\n")
+cat("Marginal R²:", round(r2_nakagawa(model_full)$R2_marginal, 4), "\n")
+cat("Conditional R²:", round(r2_nakagawa(model_full)$R2_conditional, 4), "\n")
+cat("ICC:", round(icc(model_full)$ICC_adjusted, 4), "\n")
+
+# Check if main effect is significant
+p_value <- anova_result$`Pr(>F)`[1]
+if(p_value < 0.05) {
+  cat("\n** Emotion main effect is SIGNIFICANT (p =", round(p_value, 4), ") **\n")
+  cat("Proceeding with post-hoc comparisons...\n")
+} else {
+  cat("\n** Emotion main effect is NOT significant (p =", round(p_value, 4), ") **\n")
+}
+```
+
+## Post-hoc Comparisons with FDR Correction
+
+```{r posthoc-analysis}
+if(p_value < 0.05) {
+  cat("\n===== POST-HOC COMPARISONS (FDR Corrected) =====\n\n")
+  
+  # Estimated marginal means
+  emm <- emmeans(model_full, ~ emotion)
+  cat("Estimated Marginal Means:\n")
+  print(summary(emm))
+  
+  # Pairwise comparisons with FDR correction
+  pairs_fdr <- pairs(emm, adjust = "fdr")
+  cat("\n\nPairwise Comparisons (FDR corrected):\n")
+  print(summary(pairs_fdr))
+  
+  # Convert to dataframe for saving
+  pairs_df <- as.data.frame(summary(pairs_fdr))
+  pairs_df <- pairs_df %>%
+    arrange(p.value) %>%
+    mutate(
+      sig = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01 ~ "**",
+        p.value < 0.05 ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  
+  cat("\n\nSignificant Comparisons (p < 0.05 after FDR):\n")
+  sig_pairs <- pairs_df %>% filter(p.value < 0.05)
+  if(nrow(sig_pairs) > 0) {
+    print(sig_pairs)
+  } else {
+    cat("No significant pairwise differences after FDR correction.\n")
+  }
+  
+  # Effect sizes for all pairwise comparisons
+  eff_sizes <- eff_size(emm, sigma = sigma(model_full), edf = df.residual(model_full))
+  cat("\n\nEffect Sizes (Cohen's d) for Pairwise Comparisons:\n")
+  print(eff_sizes)
+  
+  # Save post-hoc results
+  write.csv(as.data.frame(summary(emm)), 
+            file.path(output_dir, "emmeans_emotions.csv"), 
+            row.names = FALSE)
+  write.csv(pairs_df, 
+            file.path(output_dir, "pairwise_comparisons_FDR.csv"), 
+            row.names = FALSE)
+  write.csv(as.data.frame(eff_sizes), 
+            file.path(output_dir, "effect_sizes.csv"), 
+            row.names = FALSE)
+  
+} else {
+  cat("\n===== POST-HOC ANALYSIS SKIPPED =====\n")
+  cat("Main effect not significant, no post-hoc comparisons performed.\n")
+}
+```
+
+## Model Residual Diagnostics
+
+```{r residual-diagnostics}
+cat("\n===== RESIDUAL DIAGNOSTICS =====\n")
+
+# QQ plot and residual plots
+png(file.path(output_dir, "model_diagnostics.png"), width = 1200, height = 800)
+par(mfrow = c(2, 2))
+
+# QQ plot
+qqnorm(residuals(model_full), main = "QQ Plot of Residuals")
+qqline(residuals(model_full))
+
+# Residuals vs Fitted
+plot(fitted(model_full), residuals(model_full),
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+
+# Histogram of residuals
+hist(residuals(model_full), breaks = 30, 
+     main = "Histogram of Residuals", xlab = "Residuals")
+
+# Residuals by emotion
+boxplot(residuals(model_full) ~ data_unfair_reject$emotion,
+        main = "Residuals by Emotion", xlab = "Emotion", ylab = "Residuals")
+abline(h = 0, col = "red", lty = 2)
+
+dev.off()
+
+# DHARMa residual diagnostics
+simulationOutput <- simulateResiduals(fittedModel = model_full, plot = FALSE)
+png(file.path(output_dir, "DHARMa_diagnostics.png"), width = 800, height = 800)
+plot(simulationOutput)
+dev.off()
+
+cat("Diagnostic plots saved.\n")
+```
+
+# Visualization
+
+```{r visualization, fig.width=12, fig.height=8}
+cat("\n===== GENERATING VISUALIZATIONS =====\n")
+
+# Define emotion colors and labels as per your specification
+emotion_colors <- c(
+  'neu' = '#C5C5C5EC',
+  'aff' = '#39E04F', 
+  'dis' = '#755627',
+  'dom' = '#F5900C',
+  'enj' = '#FC0000'
+)
+
+emotion_labels <- c(
+  'neu' = 'Neutral',
+  'aff' = 'Affiliative',
+  'dis' = 'Disgust',
+  'dom' = 'Dominance',
+  'enj' = 'Reward'
+)
+
+# 1. Bar plot with error bars (Mean ± SE)
+p1 <- ggplot(desc_stats, aes(x = emotion, y = mean_LPP, fill = emotion)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_errorbar(aes(ymin = mean_LPP - se_LPP, ymax = mean_LPP + se_LPP), 
+                width = 0.2, size = 0.8) +
+  geom_text(aes(label = paste0("n=", n_trials)), 
+            vjust = -0.5, hjust = 0.5, size = 3) +
+  scale_fill_manual(values = emotion_colors, labels = emotion_labels) +
+  scale_x_discrete(labels = emotion_labels) +
+  ylim(0, 2.5) +  # Adjusted y-axis for better visibility
+  labs(title = "LPP Amplitude by Emotion (Unfair-Reject Condition)",
+       subtitle = paste0("Total trials: ", nrow(data_unfair_reject), 
+                        " | Participants: ", n_distinct(data_unfair_reject$participant_id),
+                        " | Time window: 400-800ms"),
+       x = "Emotion", 
+       y = "LPP Amplitude (μV)",
+       caption = "Error bars represent ± 1 SE | Electrodes: Pz, Cz, C1, C2, CP1, CP2") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+# 2. Comparison plot: All conditions for context
+context_summary <- data_analysis %>%
+  group_by(offer_type, response, emotion) %>%
+  summarise(
+    mean_LPP = mean(LPP),
+    se_LPP = sd(LPP)/sqrt(n()),
+    n = n(),
+    .groups = "drop"
+  )
+
+# Custom colors for conditions
+condition_colors <- c(
+  "Fair.Accept" = "#2ecc71",
+  "Fair.Reject" = "#27ae60",
+  "Unfair.Accept" = "#e67e22",
+  "Unfair.Reject" = "#e74c3c"
+)
+
+p2 <- ggplot(context_summary, aes(x = emotion, y = mean_LPP, 
+                                  fill = interaction(offer_type, response))) +
+  geom_bar(stat = "identity", position = position_dodge(0.8), alpha = 0.8) +
+  geom_errorbar(aes(ymin = mean_LPP - se_LPP, ymax = mean_LPP + se_LPP),
+                position = position_dodge(0.8), width = 0.2) +
+  scale_fill_manual(values = condition_colors,
+                    labels = c("Fair-Accept", "Fair-Reject", 
+                              "Unfair-Accept", "Unfair-Reject")) +
+  scale_x_discrete(labels = emotion_labels) +
+  coord_cartesian(ylim = c(-2, 3.5)) +  # Adjusted for context comparison
+  labs(title = "LPP Across All Conditions (Context)",
+       subtitle = "Unfair-Reject (red) is the focus of main analysis",
+       x = "Emotion", 
+       y = "LPP Amplitude (μV)",
+       fill = "Condition") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+# 3. Individual subject trajectories (if significant effect)
+if(p_value < 0.05) {
+  subject_means <- data_unfair_reject %>%
+    group_by(participant_id, emotion) %>%
+    summarise(mean_LPP = mean(LPP), .groups = "drop")
+  
+  p3 <- ggplot(subject_means, aes(x = emotion, y = mean_LPP)) +
+    geom_line(aes(group = participant_id), alpha = 0.2) +
+    geom_point(alpha = 0.3, size = 1) +
+    stat_summary(fun = mean, geom = "line", aes(group = 1), 
+                 color = "red", size = 1.5) +
+    stat_summary(fun = mean, geom = "point", color = "red", size = 3) +
+    scale_x_discrete(labels = emotion_labels) +
+    labs(title = "Individual Subject Patterns (Unfair-Reject)",
+         subtitle = "Gray lines = individuals | Red = grand mean",
+         x = "Emotion", 
+         y = "LPP Amplitude (μV)") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          axis.text.x = element_text(angle = 0, hjust = 0.5))
+} else {
+  # Create placeholder if not significant
+  p3 <- ggplot() + 
+    annotate("text", x = 0.5, y = 0.5, 
+             label = "Individual trajectories\n(skipped - main effect not significant)",
+             size = 5) +
+    theme_void()
+}
+
+# Combine plots (now only 3 plots)
+library(gridExtra)
+if(p_value < 0.05) {
+  combined_plot <- grid.arrange(p1, p2, p3, ncol = 2)
+} else {
+  combined_plot <- grid.arrange(p1, p2, ncol = 2)
+}
+
+# Save plots
+ggsave(file.path(output_dir, "LPP_emotion_plots.png"), 
+       combined_plot, width = 14, height = 10, dpi = 300)
+
+# Save individual plots
+ggsave(file.path(output_dir, "LPP_barplot.png"), p1, width = 8, height = 6, dpi = 300)
+ggsave(file.path(output_dir, "LPP_context.png"), p2, width = 10, height = 6, dpi = 300)
+if(p_value < 0.05) {
+  ggsave(file.path(output_dir, "LPP_individual_trajectories.png"), p3, width = 8, height = 6, dpi = 300)
+}
+
+cat("Plots saved.\n")
+```
+
+# Additional Analysis: Check Sample Sizes
+
+```{r sample-check}
+cat("\n===== SAMPLE SIZE CHECK =====\n")
+
+# Check minimum trials per emotion per subject
+subject_emotion_counts <- data_unfair_reject %>%
+  group_by(participant_id, emotion) %>%
+  summarise(n_trials = n(), .groups = "drop")
+
+min_trials_summary <- subject_emotion_counts %>%
+  group_by(emotion) %>%
+  summarise(
+    min_trials = min(n_trials),
+    max_trials = max(n_trials),
+    mean_trials = mean(n_trials),
+    n_subjects_with_data = n(),
+    .groups = "drop"
+  )
+
+cat("\nTrials per subject by emotion:\n")
+print(as.data.frame(min_trials_summary))
+
+# Identify subjects with very few trials
+low_trial_subjects <- subject_emotion_counts %>%
+  filter(n_trials < 3) %>%
+  arrange(n_trials, participant_id, emotion)
+
+if(nrow(low_trial_subjects) > 0) {
+  cat("\nWarning: Some subjects have very few trials (<3) in certain emotions:\n")
+  print(as.data.frame(low_trial_subjects))
+}
+```
+
+# Summary Report
+
+```{r summary}
+cat("\n===== FINAL SUMMARY =====\n\n")
+
+cat("ANALYSIS: LPP amplitude comparison across 5 emotions in Unfair-Reject condition\n")
+cat("=========================================================================\n\n")
+
+cat("COMPONENT INFORMATION:\n")
+cat("- ERP Component: LPP (Late Positive Potential)\n")
+cat("- Time Window: 400-800ms\n")
+cat("- ROI Electrodes: Pz, Cz, C1, C2, CP1, CP2\n\n")
+
+cat("DATA SUMMARY:\n")
+cat("- Total Unfair-Reject trials analyzed:", nrow(data_unfair_reject), "\n")
+cat("- Number of participants:", n_distinct(data_unfair_reject$participant_id), "\n")
+cat("- Emotions compared: neu, aff, dis, dom, enj\n\n")
+
+cat("STATISTICAL RESULTS:\n")
+cat("- Statistical method: Linear Mixed Model (trial-level analysis)\n")
+cat("- Random effects structure:", 
+    ifelse(length(ranef(model_full)$participant_id) > 1, 
+           "Random slopes and intercepts", "Random intercepts only"), "\n")
+cat("- Emotion main effect: F(", anova_result$NumDF[1], ",", 
+    round(anova_result$DenDF[1], 1), ") = ", 
+    round(anova_result$`F value`[1], 3), ", p = ", 
+    round(p_value, 4), "\n")
+
+if(p_value < 0.05) {
+  cat("\n- Post-hoc comparisons: Performed with FDR correction\n")
+  cat("- Number of significant pairwise differences (p < 0.05 after FDR):", 
+      nrow(filter(pairs_df, p.value < 0.05)), "out of 10\n")
+  
+  # Report the emotion with highest and lowest LPP
+  ordered_emotions <- desc_stats %>% arrange(desc(mean_LPP))
+  cat("\n- Emotion with highest LPP:", ordered_emotions$emotion[1], 
+      "(M =", round(ordered_emotions$mean_LPP[1], 3), "μV)\n")
+  cat("- Emotion with lowest LPP:", 
+      ordered_emotions$emotion[nrow(ordered_emotions)], 
+      "(M =", round(ordered_emotions$mean_LPP[nrow(ordered_emotions)], 3), "μV)\n")
+  
+  # Report significant contrasts
+  if(nrow(sig_pairs) > 0) {
+    cat("\n- Significant contrasts:\n")
+    for(i in 1:nrow(sig_pairs)) {
+      cat("  ", sig_pairs$contrast[i], ": p =", 
+          round(sig_pairs$p.value[i], 3), "\n")
+    }
+  }
+} else {
+  cat("\n- Post-hoc comparisons: Not performed (main effect not significant)\n")
+}
+
+cat("\nOUTPUT FILES:\n")
+cat("All results saved to:", output_dir, "\n")
+cat("- Trial count statistics\n")
+cat("- Descriptive statistics\n")
+cat("- ANOVA results\n")
+if(p_value < 0.05) {
+  cat("- Post-hoc comparisons with FDR correction\n")
+  cat("- Effect sizes (Cohen's d)\n")
+}
+cat("- Diagnostic plots (QQ, residuals, DHARMa)\n")
+cat("- Visualization plots (bar, violin, context, individual)\n")
+
+# Save workspace
+save.image(file.path(output_dir, "LPP_Unfair_Reject_Emotion_Analysis.RData"))
+cat("\nWorkspace saved.\n")
+cat("\n========== ANALYSIS COMPLETE ==========\n")
+```
