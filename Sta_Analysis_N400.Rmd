@@ -1,0 +1,676 @@
+---
+title: "EEG ERP Statistical Analysis - N400 Component (Final Version)"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+``` {r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999, digits = 6)
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  lme4, lmerTest, emmeans, DHARMa, ggplot2, dplyr,
+  performance, tibble, broom.mixed, effectsize, readxl, stringr, knitr
+)
+options(scipen = 999, digits = 6)
+options(contrasts = c("contr.sum", "contr.poly"))
+adjust_method <- "fdr"  # Options: "fdr", "tukey", "bonferroni"
+```
+
+# ========== [1] Data Import and Preprocessing (N400: 350-450ms) ==========
+
+``` {r data-import}
+# N400-specific paths
+data_n400 <- read.csv("D:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/export/n400_analysis/trials.csv", 
+                      stringsAsFactors = FALSE)
+data_n400$expressor <- str_extract(data_n400$stim, "(Fema\\d+|Male\\d+)")
+
+# Offer type classification
+calc_offer_type <- function(other, you) {
+  if (is.na(other) | is.na(you)) return(NA_character_)
+  pair <- paste0(as.integer(other), ":", as.integer(you))
+  if (pair %in% c("5:5", "6:4")) return("fair")
+  if (pair %in% c("8:2", "9:1")) return("unfair")
+  return("other")
+}
+
+data_n400$offer_type <- mapply(calc_offer_type, data_n400$Offers_Other, data_n400$Offers_You)
+data_n400$offer_type <- factor(data_n400$offer_type, levels = c("fair", "unfair", "other"))
+data_n400 <- data_n400[data_n400$offer_type %in% c("fair", "unfair"), ]
+data_n400$offer_type <- droplevels(data_n400$offer_type)
+
+# Covariate import
+covariate_path <- "D:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/data/SVO_PID5BF_PostRating.xlsx"
+covariate_cols <- c(
+  "participant_id", "SVO_angle", "Negative_Affectivity", "Detachment", "Antagonism",
+  "Disinhibition", "Anankastia", "Psychoticism", "Rating_1", "Rating_2", "Rating_3"
+)
+covariates <- read_excel(covariate_path)
+covariates <- covariates[, covariate_cols]
+covariates$participant_id <- as.character(covariates$participant_id)
+data_n400$participant_id <- as.character(data_n400$participant_id)
+data_n400 <- merge(data_n400, covariates, by = "participant_id", all.x = TRUE)
+
+# Standardize covariates
+covar_names <- setdiff(covariate_cols, "participant_id")
+for (v in covar_names) {
+  data_n400[[v]] <- as.numeric(data_n400[[v]])
+  data_n400[[paste0(v, "_z")]] <- scale(data_n400[[v]])
+}
+
+# Summary statistics
+cat("N400 Component Analysis Summary:\n")
+cat("================================\n")
+cat("Time Window: 350-450ms\n")
+cat("ROI: Fz, Cz, CPz, Pz\n")
+cat("Missing questionnaire data:", sum(is.na(data_n400$SVO_angle)), "\n")
+cat("Total trials:", nrow(data_n400), "\n")
+```
+
+``` {r overview}
+# Trial count summary by condition
+n400_trial_count <- data_n400 %>%
+  filter(reaction > 0) %>%
+  group_by(participant_id, emotion, offer_type, reaction) %>%
+  summarise(trial_count = n(), .groups = "drop") %>%
+  mutate(reaction_label = factor(reaction, levels = c(1, 2), labels = c("Accept", "Reject")))
+
+# Save trial counts - 使用正确的路径
+results_dir_n400 <- "D:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/export/n400_analysis/Results_Sta_LMM_N400"
+if (!dir.exists(results_dir_n400)) dir.create(results_dir_n400, recursive = TRUE)
+
+write.csv(n400_trial_count, 
+          file.path(results_dir_n400, "n400_trial_counts_by_condition.csv"), 
+          row.names = FALSE)
+
+# Display summary
+cat("\nTrial distribution summary:\n")
+print(summary(n400_trial_count$trial_count))
+```
+
+# ========== [2] Factor Assignment ==========
+
+``` {r factor-assign}
+data_n400$participant_id <- factor(data_n400$participant_id)
+data_n400$setting        <- factor(data_n400$setting)
+data_n400$emotion        <- factor(data_n400$emotion, levels = c("neu", "aff", "dis", "dom", "enj"))
+data_n400$expressor      <- factor(data_n400$expressor)
+data_n400$offer_type     <- factor(data_n400$offer_type, levels = c("fair", "unfair"))
+contrasts(data_n400$offer_type) <- matrix(c(-0.5, 0.5), ncol=1)
+contrasts(data_n400$emotion)    <- contr.sum(5)
+data_n400$reaction_label <- factor(
+  data_n400$reaction,
+  levels = c(0, 1, 2),
+  labels = c("Miss", "Accept", "Reject")
+)
+data_n400$reaction_bin <- as.numeric(data_n400$reaction_label == "Accept")
+```
+
+# ========== [3] Enhanced Public Functions (Following Script 1 Logic) ==========
+
+``` {r public-functions}
+# Find CI columns automatically
+find_CI_columns <- function(df) {
+  patterns <- list(
+    c("lower.CL", "upper.CL"),
+    c("asymp.LCL", "asymp.UCL"),
+    c("LCL", "UCL"),
+    c("lower.HPD", "upper.HPD")
+  )
+  for (p in patterns) {
+    if (all(p %in% names(df))) return(p)
+  }
+  return(NULL)
+}
+
+# Enhanced reporting function - strictly following Script 1 logic
+report_n400_results <- function(
+  model, main1 = "emotion", main2 = NULL,
+  phase_label = "N400", erp_label = "", output_dir = ".", adjust_method = "fdr"
+) {
+  anova_df <- tryCatch(as.data.frame(anova(model)), error = function(e) NULL)
+  msg_list <- c()
+  details <- ""
+  sig_main_any <- FALSE
+  
+  if (is.null(anova_df)) {
+    msg <- "ANOVA table could not be computed for this model."
+    writeLines(msg, file.path(output_dir, sprintf("%s_%s_report.txt", phase_label, erp_label)))
+    return(invisible(list(msg = msg, details = "Model error", sig_interaction = FALSE)))
+  }
+  
+  # Separate effects
+  all_effects <- rownames(anova_df)
+  intxn_names <- all_effects[grepl(":", all_effects)]
+  main_effects <- setdiff(all_effects, c(intxn_names, "(Intercept)"))
+  
+  # Check for interaction significance
+  intxn_sig <- FALSE
+  if (length(intxn_names) > 0) {
+    highest_intxn <- intxn_names[length(intxn_names)]
+    intxn_p <- anova_df[highest_intxn, "Pr(>F)"]
+    
+    if (!is.na(intxn_p) && intxn_p < 0.05) {
+      intxn_sig <- TRUE
+      msg_list <- c(msg_list, sprintf(
+        "[N400 Interaction] %s is significant, F(%s, %s) = %.2f, p = %.3g",
+        highest_intxn,
+        anova_df[highest_intxn, "numDF"], 
+        anova_df[highest_intxn, "denDF"],
+        anova_df[highest_intxn, "F value"], 
+        intxn_p
+      ))
+      
+      # Simple effects analysis ONLY if interaction is significant
+      if (!is.null(main1) && !is.null(main2)) {
+        emm <- emmeans(model, as.formula(sprintf("~ %s | %s", main1, main2)))
+        
+        pairs_main1_by_main2 <- as.data.frame(pairs(emm, by = main2, adjust = adjust_method))
+        pairs_main2_by_main1 <- as.data.frame(pairs(emm, by = main1, adjust = adjust_method))
+        
+        write.csv(as.data.frame(emm), 
+                  file.path(output_dir, sprintf("%s_%s_simple_effect_emmeans.csv", phase_label, erp_label)), 
+                  row.names = FALSE)
+        write.csv(pairs_main1_by_main2, 
+                  file.path(output_dir, sprintf("%s_%s_simple_pairs_%s_within_%s.csv", phase_label, erp_label, main1, main2)), 
+                  row.names = FALSE)
+        write.csv(pairs_main2_by_main1, 
+                  file.path(output_dir, sprintf("%s_%s_simple_pairs_%s_within_%s.csv", phase_label, erp_label, main2, main1)), 
+                  row.names = FALSE)
+        
+        details <- "Interaction significant. Simple effects saved. Main effects not interpreted."
+        msg_list <- c(msg_list, "Note: Main effects are not interpreted when interaction is significant.")
+      }
+    }
+  }
+  
+  # If NO significant interaction, check ALL main effects
+  if (!intxn_sig) {
+    # Report non-significant interaction first
+    if (length(intxn_names) > 0) {
+      intxn_p_vals <- sapply(intxn_names, function(x) anova_df[x, "Pr(>F)"])
+      msg_list <- c(msg_list, sprintf(
+        "Interaction(s) not significant: %s",
+        paste(intxn_names, "p =", round(intxn_p_vals, 3), collapse = "; ")
+      ))
+    }
+    
+    # Check each main effect
+    for (main in main_effects) {
+      p <- anova_df[main, "Pr(>F)"]
+      if (!is.na(p) && p < 0.05) {
+        sig_main_any <- TRUE
+        msg_list <- c(msg_list, sprintf(
+          "[N400 Main Effect] %s is significant, F(%s, %s) = %.2f, p = %.3g",
+          main,
+          anova_df[main, "numDF"], 
+          anova_df[main, "denDF"],
+          anova_df[main, "F value"], 
+          p
+        ))
+        
+        # Calculate and save marginal means
+        emm <- emmeans(model, as.formula(sprintf("~ %s", main)))
+        pairs_res <- as.data.frame(pairs(emm, adjust = adjust_method))
+        
+        write.csv(as.data.frame(emm), 
+                  file.path(output_dir, sprintf("%s_%s_main_effect_%s_emmeans.csv", phase_label, erp_label, main)), 
+                  row.names = FALSE)
+        write.csv(pairs_res, 
+                  file.path(output_dir, sprintf("%s_%s_main_effect_%s_pairs.csv", phase_label, erp_label, main)), 
+                  row.names = FALSE)
+      }
+    }
+    
+    if (!sig_main_any) {
+      msg_list <- c(msg_list, "[N400] No significant effects found.")
+      details <- "Neither main effects nor interactions reached significance."
+    } else {
+      details <- "No significant interaction. Significant main effects analyzed separately."
+    }
+  }
+  
+  # Write report
+  report_path <- file.path(output_dir, sprintf("%s_%s_report.txt", phase_label, erp_label))
+  writeLines(c(msg_list, "", details), report_path)
+  cat(paste(msg_list, collapse = "\n"), "\n", details, "\n\n")
+  
+  invisible(list(msg = msg_list, details = details, sig_interaction = intxn_sig))
+}
+
+# Visualization function - only plots what is significant
+plot_n400_emmeans <- function(model, out_dir, erp = "N400", main1 = "emotion", main2 = NULL, 
+                              plot_interaction = FALSE, title_suffix = "") {
+  emotion_colors <- c('dis'="#755627",'dom'="#F5900C",'neu'='#C5C5C5EC','aff'="#39E04F",'enj'="#FC0000")
+  emotion_labels <- c('dis'='Disgust','dom'='Dominance','neu'='Neutral','aff'='Affiliative','enj'='Reward')
+  
+  if (plot_interaction && !is.null(main2)) {
+    # Interaction plot - only when explicitly requested
+    emm <- emmeans(model, as.formula(sprintf("~ %s | %s", main1, main2)))
+    emm_df <- as.data.frame(emm)
+    ci_cols <- find_CI_columns(emm_df)
+    if (!is.null(ci_cols)) {
+      emm_df$ci_lower <- emm_df[[ci_cols[1]]]
+      emm_df$ci_upper <- emm_df[[ci_cols[2]]]
+    } else {
+      emm_df$ci_lower <- emm_df$emmean - emm_df$SE
+      emm_df$ci_upper <- emm_df$emmean + emm_df$SE
+    }
+    
+    p <- ggplot(emm_df, aes_string(x = main2, y = "emmean", group = main1, color = main1)) +
+      geom_point(position = position_dodge(0.3), size = 3) +
+      geom_line(position = position_dodge(0.3), linewidth = 1.2) +
+      geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), 
+                    width = 0.2, position = position_dodge(0.3), linewidth = 0.8) +
+      scale_color_manual(values = emotion_colors, labels = emotion_labels, name = "Emotion") +
+      scale_y_reverse() +
+      labs(title = sprintf("N400 Component (350-450ms)%s", title_suffix),
+           x = "Offer Type", y = "N400 Amplitude (μV)",
+           subtitle = "ROI: Fz, Cz, CPz, Pz | More negative = larger N400") +
+      theme_minimal(base_size = 14) +
+      theme(legend.position = "bottom",
+            panel.grid.minor = element_blank(),
+            plot.title = element_text(face = "bold"))
+    
+    ggsave(file.path(out_dir, "N400_interaction_plot.png"), 
+           plot = p, width = 9, height = 6, dpi = 300)
+    
+  } else {
+    # Main effect plot
+    emm <- emmeans(model, as.formula(sprintf("~ %s", main1)))
+    emm_df <- as.data.frame(emm)
+    ci_cols <- find_CI_columns(emm_df)
+    if (!is.null(ci_cols)) {
+      emm_df$ci_lower <- emm_df[[ci_cols[1]]]
+      emm_df$ci_upper <- emm_df[[ci_cols[2]]]
+    } else {
+      emm_df$ci_lower <- emm_df$emmean - emm_df$SE
+      emm_df$ci_upper <- emm_df$emmean + emm_df$SE
+    }
+    
+    if (main1 == "emotion") {
+      p <- ggplot(emm_df, aes(x = emotion, y = emmean, fill = emotion)) +
+        geom_bar(stat = "identity", alpha = 0.7, width = 0.7) +
+        geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.3, linewidth = 0.8) +
+        geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+        scale_fill_manual(values = emotion_colors, labels = emotion_labels) +
+        scale_y_reverse() +
+        labs(title = sprintf("N400 Component by Emotion%s", title_suffix),
+             x = "Emotion", y = "N400 Amplitude (μV)",
+             subtitle = "Time: 350-450ms | ROI: Fz, Cz, CPz, Pz") +
+        theme_minimal(base_size = 14) +
+        theme(legend.position = "none",
+              plot.title = element_text(face = "bold"))
+    } else {
+      p <- ggplot(emm_df, aes_string(x = main1, y = "emmean")) +
+        geom_point(size = 4, color = "darkblue") +
+        geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2, linewidth = 0.8) +
+        geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+        scale_y_reverse() +
+        labs(title = sprintf("N400 Component by %s%s", main1, title_suffix),
+             x = main1, y = "N400 Amplitude (μV)") +
+        theme_minimal(base_size = 14) +
+        theme(plot.title = element_text(face = "bold"))
+    }
+    
+    ggsave(file.path(out_dir, sprintf("N400_%s_main_effect_plot.png", main1)), 
+           plot = p, width = 7, height = 5, dpi = 300)
+  }
+}
+```
+
+# ========== [4] N400 Main Statistical Analysis (Corrected Logic) ==========
+
+``` {r n400-main-analysis}
+# N400 column name
+n400_var <- "N400"
+
+# Define all models
+all_models <- list(
+  emo_main        = "emotion + (1 | participant_id)",
+  offer_main      = "offer_type + (1 | participant_id)",
+  additive        = "emotion + offer_type + (1 | participant_id)",
+  intxn           = "emotion * offer_type + (1 | participant_id)",
+  emo_offer_reac  = "emotion * offer_type + reaction_bin + (1 | participant_id)",
+  intxn_reac      = "emotion * offer_type * reaction_bin + (1 | participant_id)"
+)
+
+# Covariate variables
+covariate_z_vars <- c("SVO_angle_z", "Negative_Affectivity_z", "Detachment_z", 
+                      "Antagonism_z", "Disinhibition_z", "Anankastia_z", 
+                      "Psychoticism_z", "Rating_1_z", "Rating_2_z", "Rating_3_z")
+
+# Model comparison storage
+model_compare_list <- list()
+
+# Main model loop with corrected logic
+for (mod_name in names(all_models)) {
+  cat("\n========== N400 Model:", mod_name, "==========\n")
+  
+  out_dir <- file.path(results_dir_n400, mod_name)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # Filter data
+  df <- data_n400[!is.na(data_n400[[n400_var]]) & 
+                   data_n400$reaction_label %in% c("Accept", "Reject"), ]
+  
+  # Fit model
+  model <- lmer(
+    as.formula(paste0(n400_var, " ~ ", all_models[[mod_name]])),
+    data = df, REML = FALSE
+  )
+  
+  if (!isSingular(model)) {
+    model_compare_list[[mod_name]] <- model
+    
+    # Save results
+    sink(file.path(out_dir, "summary.txt"))
+    cat("=== N400 Model:", mod_name, "===\n")
+    cat("Date:", Sys.Date(), "\n")
+    cat("Adjustment method:", adjust_method, "\n\n")
+    print(performance::r2(model))
+    print(summary(model))
+    print(anova(model))
+    sink()
+    
+    write.csv(as.data.frame(performance::r2(model)), 
+              file.path(out_dir, "R2.csv"), row.names = FALSE)
+    write.csv(as.data.frame(anova(model)), 
+              file.path(out_dir, "anova.csv"), row.names = TRUE)
+    write.csv(broom.mixed::tidy(model), 
+              file.path(out_dir, "coefficients.csv"), row.names = FALSE)
+    
+    # Residual diagnostics
+    png(file.path(out_dir, "DHARMa_diagnostics.png"), width = 1000, height = 800)
+    plot(DHARMa::simulateResiduals(model))
+    dev.off()
+    
+    # CORRECTED: Analysis and plotting based on significance
+    if (mod_name == "offer_main") {
+      # Single main effect model
+      report_result <- report_n400_results(model, main1 = "offer_type", main2 = NULL,
+                                           phase_label = "N400", erp_label = mod_name,
+                                           output_dir = out_dir, adjust_method = adjust_method)
+      # Check if offer_type is significant before plotting
+      anova_res <- anova(model)
+      if ("offer_type" %in% rownames(anova_res) && anova_res["offer_type", "Pr(>F)"] < 0.05) {
+        plot_n400_emmeans(model, out_dir, main1 = "offer_type", main2 = NULL,
+                         title_suffix = sprintf(" [%s]", mod_name))
+      }
+      
+    } else if (mod_name == "emo_main") {
+      # Single main effect model
+      report_result <- report_n400_results(model, main1 = "emotion", main2 = NULL,
+                                           phase_label = "N400", erp_label = mod_name,
+                                           output_dir = out_dir, adjust_method = adjust_method)
+      # Check if emotion is significant before plotting
+      anova_res <- anova(model)
+      if ("emotion" %in% rownames(anova_res) && anova_res["emotion", "Pr(>F)"] < 0.05) {
+        plot_n400_emmeans(model, out_dir, main1 = "emotion", main2 = NULL,
+                         title_suffix = sprintf(" [%s]", mod_name))
+      }
+      
+    } else if (grepl("\\*", all_models[[mod_name]])) {
+      # Models with interaction terms
+      report_result <- report_n400_results(model, main1 = "emotion", main2 = "offer_type",
+                                           phase_label = "N400", erp_label = mod_name,
+                                           output_dir = out_dir, adjust_method = adjust_method)
+      
+      # Check what's significant and plot accordingly
+      anova_res <- anova(model)
+      interaction_term <- "emotion:offer_type"
+      
+      if (interaction_term %in% rownames(anova_res)) {
+        interaction_p <- anova_res[interaction_term, "Pr(>F)"]
+        
+        if (!is.na(interaction_p) && interaction_p < 0.05) {
+          # Interaction is significant - plot interaction
+          plot_n400_emmeans(model, out_dir, main1 = "emotion", main2 = "offer_type",
+                           plot_interaction = TRUE,
+                           title_suffix = sprintf(" [%s - Significant Interaction]", mod_name))
+        } else {
+          # Interaction not significant - check and plot main effects
+          if ("emotion" %in% rownames(anova_res) && anova_res["emotion", "Pr(>F)"] < 0.05) {
+            plot_n400_emmeans(model, out_dir, main1 = "emotion", main2 = NULL,
+                             title_suffix = sprintf(" [%s - Emotion Main Effect]", mod_name))
+          }
+          if ("offer_type" %in% rownames(anova_res) && anova_res["offer_type", "Pr(>F)"] < 0.05) {
+            plot_n400_emmeans(model, out_dir, main1 = "offer_type", main2 = NULL,
+                             title_suffix = sprintf(" [%s - Offer Type Main Effect]", mod_name))
+          }
+        }
+      }
+      
+    } else if (mod_name == "additive") {
+      # Additive model - check both main effects separately
+      report_result <- report_n400_results(model, main1 = "emotion", main2 = "offer_type",
+                                           phase_label = "N400", erp_label = mod_name,
+                                           output_dir = out_dir, adjust_method = adjust_method)
+      anova_res <- anova(model)
+      
+      # Plot only significant effects
+      if ("emotion" %in% rownames(anova_res) && anova_res["emotion", "Pr(>F)"] < 0.05) {
+        plot_n400_emmeans(model, out_dir, main1 = "emotion", main2 = NULL,
+                         title_suffix = sprintf(" [%s - Emotion Main Effect]", mod_name))
+      }
+      if ("offer_type" %in% rownames(anova_res) && anova_res["offer_type", "Pr(>F)"] < 0.05) {
+        plot_n400_emmeans(model, out_dir, main1 = "offer_type", main2 = NULL,
+                         title_suffix = sprintf(" [%s - Offer Type Main Effect]", mod_name))
+      }
+    }
+  }
+}
+
+# Model comparison
+if (length(model_compare_list) > 0) {
+  comparison_df <- data.frame(
+    Model = character(), AIC = numeric(), BIC = numeric(),
+    R2m = numeric(), R2c = numeric(), df = numeric(), 
+    stringsAsFactors = FALSE
+  )
+  
+  for (nm in names(model_compare_list)) {
+    m <- model_compare_list[[nm]]
+    r2 <- performance::r2(m)
+    comparison_df <- rbind(comparison_df, data.frame(
+      Model = nm,
+      AIC = AIC(m),
+      BIC = BIC(m),
+      R2m = r2$R2_marginal,
+      R2c = r2$R2_conditional,
+      df = attr(logLik(m), "df")
+    ))
+  }
+  
+  comparison_df$deltaAIC <- comparison_df$AIC - min(comparison_df$AIC)
+  comparison_df <- comparison_df[order(comparison_df$AIC), ]
+  
+  write.csv(comparison_df, 
+            file.path(results_dir_n400, "model_comparison.csv"), 
+            row.names = FALSE)
+  
+  cat("\n========== Model Comparison Results ==========\n")
+  print(comparison_df)
+  
+  best_model_name <- comparison_df$Model[1]
+  cat("\n*** Best model (lowest AIC):", best_model_name, "***\n")
+}
+
+cat("\n========== N400 Main Analysis Complete ==========\n")
+```
+
+# ========== [5] Separate Analyses by Offer Type (Clarified) ==========
+
+``` {r n400-by-offer}
+# CLARIFICATION: Testing emotion × response interaction WITHIN each offer type
+for (ot in c("fair", "unfair")) {
+  cat("\n========== N400 Analysis for", toupper(ot), "offers only ==========\n")
+  cat("NOTE: Testing emotion effects and emotion × response interactions\n")
+  cat("      within the", ot, "condition (offer_type is fixed)\n\n")
+  
+  base_dir <- file.path(results_dir_n400, paste0(toupper(ot), "_Only"))
+  dir_main <- file.path(base_dir, "Emotion_Response_MainEffects")
+  dir_int  <- file.path(base_dir, "Emotion_X_Response_Interaction")
+  dir.create(dir_main, recursive = TRUE, showWarnings = FALSE)
+  dir.create(dir_int, recursive = TRUE, showWarnings = FALSE)
+  
+  # Filter data for this offer type only
+  df_sub <- subset(data_n400, 
+                   offer_type == ot & 
+                   !is.na(N400) & 
+                   reaction_label %in% c("Accept", "Reject"))
+  
+  if (nrow(df_sub) < 50) {
+    cat("Insufficient data for", ot, "condition. Skipping.\n")
+    next
+  }
+  
+  cat("N trials for", ot, ":", nrow(df_sub), "\n")
+  
+  df_sub$emotion <- factor(df_sub$emotion, levels = c("neu", "aff", "dis", "dom", "enj"))
+  df_sub$reaction_bin <- as.numeric(df_sub$reaction_label == "Accept")
+  
+  # Main effects model: emotion + response
+  model_main <- lmer(N400 ~ emotion + reaction_bin + (1 | participant_id), 
+                     data = df_sub, REML = FALSE)
+  
+  sink(file.path(dir_main, "summary.txt"))
+  cat("=== Main Effects Model for", ot, "offers ===\n")
+  cat("Model: N400 ~ emotion + reaction_bin\n\n")
+  print(performance::r2(model_main))
+  print(summary(model_main))
+  print(anova(model_main))
+  sink()
+  
+  write.csv(as.data.frame(anova(model_main)), 
+            file.path(dir_main, "anova.csv"), row.names = TRUE)
+  
+  # Note: main2 is NULL because we're testing main effects only
+  report_n400_results(model_main, main1 = "emotion", main2 = NULL,
+                     phase_label = paste0("N400_", ot), erp_label = "MainEffects",
+                     output_dir = dir_main, adjust_method = adjust_method)
+  
+  # Interaction model: emotion × response
+  model_int <- lmer(N400 ~ emotion * reaction_bin + (1 | participant_id), 
+                    data = df_sub, REML = FALSE)
+  
+  sink(file.path(dir_int, "summary.txt"))
+  cat("=== Emotion × Response Interaction Model for", ot, "offers ===\n")
+  cat("Model: N400 ~ emotion * reaction_bin\n")
+  cat("IMPORTANT: This tests if emotion effects differ between Accept/Reject responses\n")
+  cat("           within the", ot, "offer condition only\n\n")
+  print(performance::r2(model_int))
+  print(summary(model_int))
+  print(anova(model_int))
+  sink()
+  
+  write.csv(as.data.frame(anova(model_int)), 
+            file.path(dir_int, "anova.csv"), row.names = TRUE)
+  
+  # Create README to clarify what this interaction means
+  readme_path <- file.path(dir_int, "README_INTERACTION.txt")
+  writeLines(c(
+    paste("EMOTION × RESPONSE INTERACTION ANALYSIS FOR", toupper(ot), "OFFERS"),
+    "",
+    "This analysis tests the interaction between:",
+    "  - EMOTION (5 levels: neu, aff, dis, dom, enj)",
+    "  - RESPONSE (2 levels: Accept, Reject)",
+    "",
+    paste("Within the", ot, "offer condition only."),
+    "",
+    "This is NOT an emotion × offer_type interaction",
+    "(offer_type is fixed to", paste0(ot, ")."),
+    "",
+    "Interpretation:",
+    "A significant interaction would mean that the effect of emotion",
+    "on N400 amplitude differs between Accept and Reject responses",
+    paste("specifically for", ot, "offers.")
+  ), readme_path)
+  
+  # Note: Now main2 = "reaction_bin" for the interaction
+  report_n400_results(model_int, main1 = "emotion", main2 = "reaction_bin",
+                     phase_label = paste0("N400_", ot), erp_label = "EmotionXResponse",
+                     output_dir = dir_int, adjust_method = adjust_method)
+  
+  # Model comparison
+  comp_tab <- data.frame(
+    Model = c("MainEffects", "EmotionXResponse"),
+    AIC = c(AIC(model_main), AIC(model_int)),
+    BIC = c(BIC(model_main), BIC(model_int)),
+    R2m = c(performance::r2(model_main)$R2_marginal, 
+            performance::r2(model_int)$R2_marginal),
+    R2c = c(performance::r2(model_main)$R2_conditional, 
+            performance::r2(model_int)$R2_conditional)
+  )
+  
+  comp_tab$deltaAIC <- comp_tab$AIC - min(comp_tab$AIC)
+  
+  write.csv(comp_tab, file.path(base_dir, "model_comparison.csv"), row.names = FALSE)
+  
+  cat("\nModel comparison for", ot, ":\n")
+  print(comp_tab)
+  
+  # Determine which model is better
+  if (comp_tab$deltaAIC[2] < -2) {
+    cat("Interaction model substantially better (deltaAIC > 2)\n")
+  } else if (comp_tab$deltaAIC[1] < -2) {
+    cat("Main effects model substantially better (deltaAIC > 2)\n")
+  } else {
+    cat("Models comparable (deltaAIC < 2), prefer simpler main effects model\n")
+  }
+}
+```
+
+# ========== [6] Final Summary Report ==========
+
+``` {r final-summary}
+summary_file <- file.path(results_dir_n400, "N400_ANALYSIS_SUMMARY.txt")
+sink(summary_file)
+cat("================================================================\n")
+cat("           N400 COMPONENT STATISTICAL ANALYSIS SUMMARY         \n")
+cat("================================================================\n\n")
+cat("Analysis Date:", Sys.Date(), "\n")
+cat("Time Window: 350-450ms\n")
+cat("ROI: Fz, Cz, CPz, Pz\n")
+cat("Multiple Comparison Adjustment:", adjust_method, "\n\n")
+
+cat("--- DATA SUMMARY ---\n")
+df_final <- data_n400[!is.na(data_n400[[n400_var]]) & 
+                       data_n400$reaction_label %in% c("Accept", "Reject"), ]
+cat("Total trials analyzed:", nrow(df_final), "\n")
+cat("Number of participants:", length(unique(df_final$participant_id)), "\n\n")
+
+cat("Trial distribution by condition:\n")
+print(table(df_final$emotion, df_final$offer_type))
+cat("\nTrial distribution by response:\n")
+print(table(df_final$emotion, df_final$reaction_label))
+
+if (exists("comparison_df")) {
+  cat("\n--- MODEL COMPARISON ---\n")
+  cat("Models tested:\n")
+  cat("  emo_main: emotion only\n")
+  cat("  offer_main: offer_type only\n")
+  cat("  additive: emotion + offer_type (no interaction)\n")
+  cat("  intxn: emotion * offer_type (with interaction)\n")
+  cat("  emo_offer_reac: emotion * offer_type + reaction\n")
+  cat("  intxn_reac: emotion * offer_type * reaction (three-way)\n\n")
+  
+  print(comparison_df[, c("Model", "AIC", "deltaAIC", "R2m", "R2c")])
+  cat("\n*** Best Model:", best_model_name, "***\n")
+}
+
+cat("\n--- KEY ANALYSIS NOTES ---\n")
+cat("1. Plots are only generated for SIGNIFICANT effects\n")
+cat("2. When interaction is significant, main effects are not interpreted\n")
+cat("3. FAIR_Only and UNFAIR_Only test emotion × response interactions\n")
+cat("   (NOT emotion × offer_type, as offer_type is fixed)\n")
+cat("4. All pairwise comparisons use", adjust_method, "correction\n")
+
+sink()
+
+cat("\n========== COMPLETE ANALYSIS FINISHED ==========\n")
+cat("Results saved to:", results_dir_n400, "\n")
+cat("Summary saved to:", summary_file, "\n")
+```
+

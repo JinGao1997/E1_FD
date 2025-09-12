@@ -1,0 +1,181 @@
+---
+title: "N400_Topography_Plotting"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+``` {r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+``` {r n400_topo}
+library(tidyverse)
+library(eegUtils)
+if ("package:plyr" %in% loadedNamespaces()) detach("package:plyr", unload=TRUE)
+
+# 1. 目录设置
+data_dir       <- "D:/PD_E1_UG_jg/EEG_R_Python_Pipeline_JG_Backup/E1_UG/export/n400_analysis"
+plot_dir       <- file.path(data_dir, "plots_N400")
+raw_dir        <- file.path(plot_dir, "raw")
+diff_dir       <- file.path(plot_dir, "diff")
+emo_main_dir   <- file.path(plot_dir, "emotion_main")
+emo_diff_dir   <- file.path(plot_dir, "emotion_diff")
+offer_main_dir <- file.path(plot_dir, "offer_main")
+offer_diff_dir <- file.path(plot_dir, "offer_diff")
+dir.create(raw_dir,        recursive=TRUE, showWarnings=FALSE)
+dir.create(diff_dir,       recursive=TRUE, showWarnings=FALSE)
+dir.create(emo_main_dir,   recursive=TRUE, showWarnings=FALSE)
+dir.create(emo_diff_dir,   recursive=TRUE, showWarnings=FALSE)
+dir.create(offer_main_dir, recursive=TRUE, showWarnings=FALSE)
+dir.create(offer_diff_dir, recursive=TRUE, showWarnings=FALSE)
+
+# 2. 读入数据
+grand   <- read_csv(file.path(data_dir, "grand_ave_GROUPLEVEL.csv"), show_col_types=FALSE)
+chanlocs <- read_csv(file.path(data_dir, "channel_locations.csv"), show_col_types=FALSE)
+names(chanlocs)[names(chanlocs)=="channel"] <- "electrode"
+
+# 3. 主要参数
+eeg_cols     <- c(
+  "Fp1","Fpz","Fp2","AF7","AF3","AFz","AF4","AF8",
+  "F9","F7","F5","F3","Fz","F4","F6","F8","F10","FT7",
+  "FC5","FC3","FC1","FC2","FC4","FC6","FT8","T7","C5","C3",
+  "C1","Cz","C2","C4","C6","T8","TP9","TP7","CP5","CP3",
+  "CP1","CPz","CP2","CP4","CP6","TP8","TP10","P7","P5","P3",
+  "Pz","P4","P6","P8","PO9","PO7","PO3","POz","PO4","PO8",
+  "PO10","O1","Oz","O2"
+)
+n400_win      <- c(0.350, 0.450)  # N400时间窗350-450ms
+roi_n400      <- c("Fz","Cz","CPz","Pz")  # N400 ROI
+emotion_list <- c("aff","dis","dom","enj")
+offer_types  <- c("fair","unfair")
+time_labels  <- list(N400="350–450")
+
+# 4. 色阶范围设置
+compute_global_limits <- function(win) {
+  amps <- map_df(offer_types, function(ofr) {
+    map_df(c("neu", emotion_list), function(emo) {
+      grand %>%
+        filter(emotion==emo, offer_type==ofr, time>=win[1], time<=win[2]) %>%
+        summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE)) %>%
+        pivot_longer(everything(), names_to="el", values_to="amp")
+    })
+  })
+  m <- max(abs(amps$amp), na.rm=TRUE); c(-m, m)
+}
+
+# 差异图限制计算 - 使用enj作为基线
+compute_diff_limits <- function(win) {
+  diffs <- map_df(offer_types, function(ofr) {
+    map_df(c("neu","aff","dis","dom"), function(emo) {  # 与enj比较的情绪
+      m1 <- grand %>%
+        filter(emotion==emo, offer_type==ofr, time>=win[1], time<=win[2]) %>%
+        summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+      m_enj <- grand %>%
+        filter(emotion=="enj", offer_type==ofr, time>=win[1], time<=win[2]) %>%
+        summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+      (m1 - m_enj) %>% pivot_longer(everything(), names_to="el", values_to="amp")
+    })
+  })
+  m <- max(abs(diffs$amp), na.rm=TRUE); c(-m, m)
+}
+
+# 建议先自动跑一遍limits再手动指定
+limits_raw  <- list(N400=compute_global_limits(n400_win))
+limits_diff <- list(N400=compute_diff_limits(n400_win))
+limits_raw$N400 <- c(-3.0, 2.0)  # 手动指定原始图色阶
+
+# 5. 画图主函数，加 contour 参数
+plot_topo <- function(dat_long, chans, roi, comp, subtitle, caption, fname, lims, contour=TRUE) {
+  p <- topoplot(dat_long,
+                chan_locs    = chans,
+                interp_limit = "head",
+                contour      = contour,
+                points       = TRUE,
+                highlights   = roi,
+                palette      = "RdBu",
+                limits       = lims) +
+       labs(title=comp, subtitle=subtitle, caption=caption) +
+       theme(plot.title=element_text(size=18,face="bold"),
+             plot.subtitle=element_text(size=14),
+             plot.caption=element_text(size=12, color="grey40"))
+  ggsave(fname, plot=p, device="tiff", width=6, height=6, dpi=300)
+}
+
+# 6. Raw topographies → raw_dir (contour=TRUE)
+comp <- "N400"
+win    <- n400_win
+roi    <- roi_n400
+lims   <- limits_raw[[comp]]
+tlabel <- time_labels[[comp]]
+for (ofr in offer_types) for (emo in c("neu", emotion_list)) {
+  dat_avg   <- grand %>%
+    filter(emotion==emo, offer_type==ofr, time>=win[1], time<=win[2]) %>%
+    summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE)) %>%
+    pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+  subtitle  <- paste(ofr, emo, sep=" | ")
+  caption   <- paste0(tlabel, " ms [limits: ", paste(lims, collapse=", "), "]")
+  fname     <- file.path(raw_dir, sprintf("%s_%s_%s.tiff", comp, ofr, emo))
+  plot_topo(dat_avg, chanlocs, roi, comp, subtitle, caption, fname, lims, contour=TRUE)
+}
+
+# 7. Conditional diffs → diff_dir (contour=FALSE) - 使用enj作为基线
+for (ofr in offer_types) for (emo in c("neu","aff","dis","dom")) {  # 与enj比较
+  m1       <- grand %>% filter(emotion==emo,    offer_type==ofr, time>=win[1], time<=win[2]) %>%
+                summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+  m_enj    <- grand %>% filter(emotion=="enj",  offer_type==ofr, time>=win[1], time<=win[2]) %>%
+                summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+  diff_dat <- (m1 - m_enj) %>% pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+  subtitle <- paste(ofr, paste0(emo," – enj"), sep=" | ")
+  caption  <- paste0(tlabel, " ms [limits: ", paste(limits_diff$N400, collapse=", "), "]")
+  fname    <- file.path(diff_dir, sprintf("%s_diff_%s_%s_vs_enj.tiff", comp, ofr, emo))
+  plot_topo(diff_dat, chanlocs, roi, comp, subtitle, caption, fname, limits_diff$N400, contour=FALSE)
+}
+
+# 8. Emotion main effects → emo_main_dir (contour=TRUE)
+for (emo in c("neu", emotion_list)) {
+  dat_avg   <- grand %>% filter(emotion==emo, time>=win[1], time<=win[2]) %>%
+                summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE)) %>%
+                pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+  subtitle  <- paste0(emo, " (avgOffers)")
+  caption   <- paste0(tlabel, " ms [limits: ", paste(lims, collapse=", "), "]")
+  fname     <- file.path(emo_main_dir, sprintf("%s_%s_avgOffers.tiff", comp, emo))
+  plot_topo(dat_avg, chanlocs, roi, comp, subtitle, caption, fname, lims, contour=TRUE)
+}
+
+# 9. Emotion diffs main → emo_diff_dir (contour=FALSE) - 使用enj作为基线
+for (emo in c("neu","aff","dis","dom")) {  # 与enj比较
+  m_emo    <- grand %>% filter(emotion==emo, time>=win[1], time<=win[2]) %>%
+                summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+  m_enj    <- grand %>% filter(emotion=="enj", time>=win[1], time<=win[2]) %>%
+                summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+  diff_dat <- (m_emo - m_enj) %>% pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+  subtitle <- paste0(emo, " – enj (avgOffers)")
+  caption  <- paste0(tlabel, " ms [limits: ", paste(limits_diff$N400, collapse=", "), "]")
+  fname    <- file.path(emo_diff_dir, sprintf("%s_diff_%s_vs_enj_avgOffers.tiff", comp, emo))
+  plot_topo(diff_dat, chanlocs, roi, comp, subtitle, caption, fname, limits_diff$N400, contour=FALSE)
+}
+
+# 10. Offer main effects → offer_main_dir (contour=TRUE)
+for (ofr in offer_types) {
+  dat_avg   <- grand %>% filter(offer_type==ofr, time>=win[1], time<=win[2]) %>%
+                summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE)) %>%
+                pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+  subtitle  <- paste0(ofr, " (avgEmotions)")
+  caption   <- paste0(tlabel, " ms [limits: ", paste(lims, collapse=", "), "]")
+  fname     <- file.path(offer_main_dir, sprintf("%s_offer_%s_avgEmotions.tiff", comp, ofr))
+  plot_topo(dat_avg, chanlocs, roi, comp, subtitle, caption, fname, lims, contour=TRUE)
+}
+
+# 11. Offer diffs main → offer_diff_dir (contour=FALSE)
+m_unfair <- grand %>% filter(offer_type=="unfair", time>=win[1], time<=win[2]) %>%
+              summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+m_fair   <- grand %>% filter(offer_type=="fair",   time>=win[1], time<=win[2]) %>%
+              summarise_at(vars(all_of(eeg_cols)), ~ mean(.x, na.rm=TRUE))
+diff_dat <- (m_unfair - m_fair) %>% pivot_longer(everything(), names_to="electrode", values_to="amplitude")
+subtitle <- "unfair – fair (avgEmotions)"
+caption  <- paste0(tlabel, " ms [limits: ", paste(limits_diff$N400, collapse=", "), "]")
+fname    <- file.path(offer_diff_dir, sprintf("%s_diff_unfair_fair_avgEmotions.tiff", comp))
+plot_topo(diff_dat, chanlocs, roi, comp, subtitle, caption, fname, limits_diff$N400, contour=FALSE)
+
+message("✅ [N400] All topoplots saved and archived under: ", plot_dir)
+```
