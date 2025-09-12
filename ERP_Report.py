@@ -2,7 +2,7 @@
 import os
 import pandas as pd
 
-root_dir = r"E:\PD_E1_UG_jg\EEG_R_Python_Pipeline_JG_Backup\E1_UG\offerphase400600"
+root_dir = r"D:\PD_E1_UG_jg\EEG_R_Python_Pipeline_JG_Backup\E1_UG\offerphase500800"
 phases = ["offer_phase", "face_phase"]
 
 def add_labels_offer(input_path, output_path):
@@ -45,7 +45,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # ========== 公共参数 ==========
-root_dir = r"E:\PD_E1_UG_jg\EEG_R_Python_Pipeline_JG_Backup\E1_UG\offerphase400600"
+root_dir = r"D:\PD_E1_UG_jg\EEG_R_Python_Pipeline_JG_Backup\E1_UG\offerphase500800"
 full_label = {'dis': 'Disgust', 'dom': 'Dominance', 'neu': 'Neutral', 'aff': 'Affiliative', 'enj': 'Reward'}
 emotion_colors = {'dis': "#755627", 'dom': "#F5900C", 'neu': "#C5C5C5EC", 'aff': "#39E04F", 'enj': "#FC0000"}
 emotions = list(full_label.keys())
@@ -62,7 +62,7 @@ offer_types = ['fair', 'unfair']
 #     "P1": {"roi": ["O1", "O2", "Oz", "PO7", "PO8"], "win": (0.08, 0.13), "ylabel": "P1 (µV)"},
 #     "N170": {"roi": ["TP9", "TP10", "P7", "P8", "PO9", "PO10", "O1", "O2"], "win": (0.13, 0.20), "ylabel": "N170 (µV)"},
 #     "EPN": {"roi": ["PO7", "PO8", "PO9", "PO10", "TP9", "TP10"], "win": (0.20, 0.35), "ylabel": "EPN (µV)"},
-#     "LPP_face": {"roi": ["Pz", "Cz", "C1", "C2", "CP1", "CP2"], "win": (0.4, 0.60), "ylabel": "LPP (µV)"},
+#     "LPP_face": {"roi": ["Pz", "Cz", "C1", "C2", "CP1", "CP2"], "win": (0.50, 0.80), "ylabel": "LPP (µV)"},
 # }
 
 # def plot_erp_by_emotion_auto(df, erp, roi_chans, win, ylab, title, ylim=None, save_dir=None):
@@ -124,7 +124,7 @@ os.makedirs(offer_save_dir, exist_ok=True)
 
 offer_erp_settings = {
     "FRN": {"roi": ["F3", "Fz", "F4", "FC1", "FC2", "Cz"], "win": (0.25, 0.30), "ylabel": "FRN (µV)"},
-    "LPP_offer": {"roi": ["Pz", "Cz", "C1", "C2", "CP1", "CP2"], "win": (0.40, 0.60), "ylabel": "LPP (µV)"}
+    "LPP_offer": {"roi": ["Pz", "Cz", "C1", "C2", "CP1", "CP2"], "win": (0.50, 0.80), "ylabel": "LPP (µV)"}
 }
 
 def plot_fair_vs_unfair_by_emotion(df, erp, ylab, win, ylim=None, save_dir=None):
